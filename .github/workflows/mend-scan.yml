@@ -8,6 +8,7 @@ jobs:
   mend-scan:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - name: Run Mend scan
         env:
           MEND_HOME: /opt/mend
