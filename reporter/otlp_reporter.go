@@ -545,13 +545,6 @@ func (r *OTLPReporter) getProfile() (profile *profiles.Profile, startTS, endTS u
 
 		// Walk every frame of the trace.
 		for i := range traceInfo.frameTypes {
-<<<<<<< HEAD
-=======
-			frameAttributes := addProfileAttributes(profile, []attrKeyValue[string]{
-				{key: "profile.frame.type", value: traceInfo.frameTypes[i].String()},
-			}, attributeMap)
-
->>>>>>> 8ea42ea (Add PID as an attribute in each sample (#212))
 			loc := &profiles.Location{
 				// Id - Optional element we do not use.
 				TypeIndex: getStringMapIndex(stringMap,
