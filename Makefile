@@ -28,6 +28,7 @@ COMPILER_TARGET ?= $(COMPILER_TARGET_ARCH)-redhat-linux
 SYSROOT_PATH ?= /
 
 export CC = clang-16
+export COMPILER_TARGET
 export CGO_CFLAGS = --sysroot=/usr/sysroot --target=$(COMPILER_TARGET)
 export CGO_ENABLED = 1
 export CGO_LDFLAGS = -fuse-ld=lld --sysroot=/usr/sysroot
@@ -122,11 +123,11 @@ docker-image:
 
 agent:
 	docker run -v "$$PWD":/agent -v $(SYSROOT_PATH):/usr/sysroot -it --rm --user $(shell id -u):$(shell id -g) profiling-agent \
-	   "make TARGET_ARCH=$(TARGET_ARCH) VERSION=$(VERSION) REVISION=$(REVISION) BUILD_TIMESTAMP=$(BUILD_TIMESTAMP)"
+	   "make COMPILER_TARGET=$(COMPILER_TARGET) TARGET_ARCH=$(TARGET_ARCH) VERSION=$(VERSION) REVISION=$(REVISION) BUILD_TIMESTAMP=$(BUILD_TIMESTAMP)"
 
 debug-agent:
 	docker run -v "$$PWD":/agent -v $(SYSROOT_PATH):/usr/sysroot -it --rm --user $(shell id -u):$(shell id -g) profiling-agent \
-	   "make TARGET_ARCH=$(TARGET_ARCH) VERSION=$(VERSION) REVISION=$(REVISION) BUILD_TIMESTAMP=$(BUILD_TIMESTAMP) debug"
+	   "make COMPILER_TARGET=$(COMPILER_TARGET) TARGET_ARCH=$(TARGET_ARCH) VERSION=$(VERSION) REVISION=$(REVISION) BUILD_TIMESTAMP=$(BUILD_TIMESTAMP) debug"
 
 legal:
 	@go install github.com/google/go-licenses@latest
