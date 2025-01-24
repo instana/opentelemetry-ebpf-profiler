@@ -17,7 +17,8 @@ RUN apt-get update -y \
 
 RUN wget https://apt.llvm.org/llvm.sh \
     && chmod +x llvm.sh \
-    && ./llvm.sh 17
+    && ./llvm.sh 17 \
+    && apt install clang-format-17
 
 COPY go.mod /tmp/go.mod
 # Extract Go version from go.mod
