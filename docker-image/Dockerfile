@@ -17,7 +17,8 @@ RUN apt-get update -y \
 
 RUN wget https://apt.llvm.org/llvm.sh \
     && chmod +x llvm.sh \
-    && ./llvm.sh 17
+    && ./llvm.sh 17 \
+    && apt install clang-format-17
 
 COPY go.mod /tmp/go.mod
 # Extract Go version from go.mod
@@ -38,7 +39,7 @@ ENV PATH="/usr/local/go/bin:$PATH"
 RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.31.0
 RUN go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.3.0
 RUN go install github.com/jcchavezs/porto/cmd/porto@v0.6.0
-RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.60.1
+RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.63.4
 
 RUN                                                                                \
   PB_URL="https://github.com/protocolbuffers/protobuf/releases/download/v24.4/";   \
