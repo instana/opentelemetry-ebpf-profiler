@@ -42,11 +42,20 @@ The agent can be built with the provided make targets. Docker is required for co
      ```sh
      make docker-image
      ```
+     The default name of the produced image is "profiling-agent", you can change it using the variable BUILD_IMAGE.
   2. Build the agent for your current machine's architecture with your current environment serving as sysroot:
      ```sh
      make agent
      ```
      Or `make debug-agent` for debug build.
+     To build the agent without enabling a TTY for enduser interaction:
+     ```sh
+     BUILD_ENV="ci" make agent
+     ```
+     The default name of the docker image used is "profiling-agent", you can change it using the variable BUILD_IMAGE:
+     ```sh
+     BUILD_IMAGE="myregistry:5000/profiling-agent:debug" make agent
+     ```
   3. To cross-compile for a different architecture (e.g. arm64):
      ```sh
      SYSROOT_PATH=/path/to/your/desired/sysroot TARGET_ARCH=arm64 make agent
