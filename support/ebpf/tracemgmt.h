@@ -1,5 +1,4 @@
-// Provides functionality for adding frames to traces, hashing traces and
-// updating trace counts
+// Provides functionality for adding frames to traces and updating trace counts
 
 #ifndef OPTI_TRACEMGMT_H
 #define OPTI_TRACEMGMT_H
@@ -299,7 +298,7 @@ static inline __attribute__((__always_inline__)) ErrorCode _push_with_max_frames
   }
 
 #ifdef TESTING_COREDUMP
-  // utils/coredump uses CGO to build the eBPF code. This dispatches
+  // tools/coredump uses CGO to build the eBPF code. This dispatches
   // the frame information directly to helper implemented in ebpfhelpers.go.
   int __push_frame(u64, u64, u64, u8, u8);
   trace->stack_len++;

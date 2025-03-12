@@ -490,7 +490,7 @@ func initializeMapsAndPrograms(kernelSymbols *libpf.SymbolMap, cfg *Config) (
 		return nil, nil, fmt.Errorf("failed to load perf eBPF programs: %v", err)
 	}
 
-	if cfg.OffCPUThreshold < support.OffCPUThresholdMax {
+	if cfg.OffCPUThreshold > 0 {
 		if err = loadKProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], tailCallProgs,
 			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD()); err != nil {
 			return nil, nil, fmt.Errorf("failed to load kprobe eBPF programs: %v", err)
@@ -554,7 +554,7 @@ func loadAllMaps(coll *cebpf.CollectionSpec, cfg *Config,
 	// On modern systems /proc/sys/kernel/pid_max defaults to 4194304.
 	// Try to fit this PID space scaled down with cfg.OffCPUThreshold into
 	// this map.
-	adaption["sched_times"] = (4194304 / support.OffCPUThresholdMax) * cfg.OffCPUThreshold
+	adaption["sched_times"] = (4194304 * cfg.OffCPUThreshold) / support.OffCPUThresholdMax
 
 	for i := support.StackDeltaBucketSmallest; i <= support.StackDeltaBucketLargest; i++ {
 		mapName := fmt.Sprintf("exe_id_to_%d_stack_deltas", i)
@@ -562,14 +562,13 @@ func loadAllMaps(coll *cebpf.CollectionSpec, cfg *Config,
 	}
 
 	for mapName, mapSpec := range coll.Maps {
+		if mapName == "sched_times" && cfg.OffCPUThreshold == 0 {
+			// Off CPU Profiling is disabled. So do not load this map.
+			continue
+		}
 		if newSize, ok := adaption[mapName]; ok {
 			log.Debugf("Size of eBPF map %s: %v", mapName, newSize)
 			mapSpec.MaxEntries = newSize
-		}
-		if mapName == "sched_times" &&
-			cfg.OffCPUThreshold >= support.OffCPUThresholdMax {
-			// Off CPU Profiling is not enabled. So do not load this map.
-			continue
 		}
 		ebpfMap, err := cebpf.NewMap(mapSpec)
 		if err != nil {
@@ -979,10 +978,11 @@ func (t *Tracer) loadBpfTrace(raw []byte, cpu int) *host.Trace {
 	}
 
 	pid := libpf.PID(ptr.pid)
+	procMeta := t.processManager.MetaForPID(pid)
 	trace := &host.Trace{
 		Comm:             C.GoString((*C.char)(unsafe.Pointer(&ptr.comm))),
-		ExecutablePath:   t.processManager.ExePathForPID(pid),
-		ProcessName:      t.processManager.NameForPID(pid),
+		ExecutablePath:   procMeta.Executable,
+		ProcessName:      procMeta.Name,
 		APMTraceID:       *(*libpf.APMTraceID)(unsafe.Pointer(&ptr.apm_trace_id)),
 		APMTransactionID: *(*libpf.APMTransactionID)(unsafe.Pointer(&ptr.apm_transaction_id)),
 		PID:              pid,
@@ -1037,19 +1037,14 @@ func (t *Tracer) loadBpfTrace(raw []byte, cpu int) *host.Trace {
 			ReturnAddress: rawFrame.return_address != 0,
 		}
 	}
-
 	return trace
 }
 
 // StartMapMonitors starts goroutines for collecting metrics and monitoring eBPF
 // maps for tracepoints, new traces, trace count updates and unknown PCs.
-func (t *Tracer) StartMapMonitors(ctx context.Context, traceOutChan chan *host.Trace) error {
+func (t *Tracer) StartMapMonitors(ctx context.Context, traceOutChan chan<- *host.Trace) error {
 	eventMetricCollector := t.startEventMonitor(ctx)
-
-	startPollingPerfEventMonitor(ctx, t.ebpfMaps["trace_events"], t.intervals.TracePollInterval(),
-		t.samplesPerSecond*int(unsafe.Sizeof(C.Trace{})), func(rawTrace []byte, cpu int) {
-			traceOutChan <- t.loadBpfTrace(rawTrace, cpu)
-		})
+	traceEventMetricCollector := t.startTraceEventMonitor(ctx, traceOutChan)
 
 	pidEvents := make([]uint32, 0)
 	periodiccaller.StartWithManualTrigger(ctx, t.intervals.MonitorInterval(),
@@ -1168,6 +1163,7 @@ func (t *Tracer) StartMapMonitors(ctx context.Context, traceOutChan chan *host.T
 
 	periodiccaller.Start(ctx, t.intervals.MonitorInterval(), func() {
 		metrics.AddSlice(eventMetricCollector())
+		metrics.AddSlice(traceEventMetricCollector())
 		metrics.AddSlice(t.eBPFMetricsCollector(translateIDs, previousMetricValue))
 
 		metrics.AddSlice([]metrics.Metric{
@@ -1301,16 +1297,27 @@ func (t *Tracer) StartOffCPUProfiling() error {
 		return errors.New("off-cpu program finish_task_switch is not available")
 	}
 
-	kprobeSymbol, err := t.kernelSymbols.LookupSymbolByPrefix("finish_task_switch")
-	if err != nil {
-		return errors.New("failed to find kernel symbol for finish_task_switch")
-	}
-
-	kprobeLink, err := link.Kprobe(string(kprobeSymbol.Name), kprobeProg, nil)
+	hookSymbolPrefix := "finish_task_switch"
+	kprobeSymbs, err := t.kernelSymbols.LookupSymbolsByPrefix(hookSymbolPrefix)
 	if err != nil {
 		return err
 	}
-	t.hooks[hookPoint{group: "kprobe", name: "finish_task_switch"}] = kprobeLink
+
+	attached := false
+	// Attach to all symbols with the prefix finish_task_switch.
+	for _, symb := range kprobeSymbs {
+		kprobeLink, linkErr := link.Kprobe(string(symb.Name), kprobeProg, nil)
+		if linkErr != nil {
+			log.Warnf("Failed to attach to %s: %v", symb.Name, linkErr)
+			continue
+		}
+		attached = true
+		t.hooks[hookPoint{group: "kprobe", name: string(symb.Name)}] = kprobeLink
+	}
+	if !attached {
+		return fmt.Errorf("failed to attach to one of %d symbols with prefix '%s'",
+			len(kprobeSymbs), hookSymbolPrefix)
+	}
 
 	// Attach the first hook that enables off-cpu profiling.
 	tpProg, ok := t.ebpfProgs["tracepoint__sched_switch"]

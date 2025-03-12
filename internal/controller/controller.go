@@ -11,7 +11,6 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/host"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
-	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/times"
 	"go.opentelemetry.io/ebpf-profiler/tracehandler"
 	"go.opentelemetry.io/ebpf-profiler/tracer"
@@ -72,8 +71,6 @@ func (c *Controller) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start reporter: %w", err)
 	}
 
-	metrics.SetReporter(c.reporter)
-
 	// Load the eBPF code and map definitions
 	trc, err := tracer.NewTracer(ctx, &tracer.Config{
 		Reporter:               c.reporter,
@@ -108,7 +105,7 @@ func (c *Controller) Start(ctx context.Context) error {
 	}
 	log.Info("Attached tracer program")
 
-	if c.config.OffCPUThreshold < support.OffCPUThresholdMax {
+	if c.config.OffCPUThreshold > 0 {
 		if err := trc.StartOffCPUProfiling(); err != nil {
 			return fmt.Errorf("failed to start off-cpu profiling: %v", err)
 		}

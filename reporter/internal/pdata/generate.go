@@ -5,16 +5,17 @@ package pdata // import "go.opentelemetry.io/ebpf-profiler/reporter/internal/pda
 
 import (
 	"crypto/rand"
+	"path/filepath"
 	"slices"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pprofile"
-	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.30.0"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
-	"go.opentelemetry.io/ebpf-profiler/reporter/internal/samples"
+	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/support"
 )
 
@@ -31,6 +32,11 @@ func (p *Pdata) Generate(events map[libpf.Origin]samples.KeyToEventMapping) ppro
 	sp := rp.ScopeProfiles().AppendEmpty()
 	for _, origin := range []libpf.Origin{support.TraceOriginSampling,
 		support.TraceOriginOffCPU} {
+		if len(events[origin]) == 0 {
+			// Do not append empty profiles, if there
+			// is not profiling data for this origin.
+			continue
+		}
 		prof := sp.Profiles().AppendEmpty()
 		prof.SetProfileID(pprofile.ProfileID(mkProfileID()))
 		p.setProfile(origin, events[origin], prof)
@@ -112,7 +118,7 @@ func (p *Pdata) setProfile(
 			loc := profile.LocationTable().AppendEmpty()
 			loc.SetAddress(uint64(traceInfo.Linenos[i]))
 			attrMgr.AppendOptionalString(loc.AttributeIndices(),
-				"profile.frame.type", traceInfo.FrameTypes[i].String())
+				semconv.ProfileFrameTypeKey, traceInfo.FrameTypes[i].String())
 
 			switch frameKind := traceInfo.FrameTypes[i]; frameKind {
 			case libpf.NativeFrame:
@@ -147,9 +153,11 @@ func (p *Pdata) setProfile(
 					// semantic convention for build_id, replace these hard coded
 					// strings.
 					attrMgr.AppendOptionalString(mapping.AttributeIndices(),
-						"process.executable.build_id.gnu", ei.GnuBuildID)
+						semconv.ProcessExecutableBuildIDGnuKey,
+						ei.GnuBuildID)
 					attrMgr.AppendOptionalString(mapping.AttributeIndices(),
-						"process.executable.build_id.htlhash", traceInfo.Files[i].StringNoQuotes())
+						semconv.ProcessExecutableBuildIDHtlhashKey,
+						traceInfo.Files[i].StringNoQuotes())
 				}
 				loc.SetMappingIndex(locationMappingIndex)
 			case libpf.AbortFrame:
@@ -193,14 +201,21 @@ func (p *Pdata) setProfile(
 			}
 		}
 
+		exeName := traceKey.ExecutablePath
+		if exeName != "" {
+			_, exeName = filepath.Split(exeName)
+		}
+
 		attrMgr.AppendOptionalString(sample.AttributeIndices(),
 			semconv.ContainerIDKey, traceKey.ContainerID)
 		attrMgr.AppendOptionalString(sample.AttributeIndices(),
 			semconv.ThreadNameKey, traceKey.Comm)
+
 		attrMgr.AppendOptionalString(sample.AttributeIndices(),
-			semconv.ProcessExecutableNameKey, traceKey.ProcessName)
+			semconv.ProcessExecutableNameKey, exeName)
 		attrMgr.AppendOptionalString(sample.AttributeIndices(),
 			semconv.ProcessExecutablePathKey, traceKey.ExecutablePath)
+
 		attrMgr.AppendOptionalString(sample.AttributeIndices(),
 			semconv.ServiceNameKey, traceKey.ApmServiceName)
 		attrMgr.AppendInt(sample.AttributeIndices(),
@@ -293,6 +308,7 @@ func getDummyMappingIndex(fileIDtoMapping map[libpf.FileID]int32,
 	mapping := profile.MappingTable().AppendEmpty()
 	mapping.SetFilenameStrindex(getStringMapIndex(stringMap, ""))
 	attrMgr.AppendOptionalString(mapping.AttributeIndices(),
-		"process.executable.build_id.htlhash", fileID.StringNoQuotes())
+		semconv.ProcessExecutableBuildIDHtlhashKey,
+		fileID.StringNoQuotes())
 	return locationMappingIndex
 }

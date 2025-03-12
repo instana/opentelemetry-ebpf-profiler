@@ -102,9 +102,9 @@ devfiler spins up a local server that listens on `0.0.0.0:11000`.
 
 To run it, simply download and unpack the archive from the following URL:
 
-https://upload.elastic.co/d/08ee5a08cdd4587d8db617e5b0a468667d3eda4698d30f78012077fbe5dc7a45
+https://upload.elastic.co/d/05d06f7a9a1898bc39e90b74647a1fb3ae19db7497d88e22aea27f47b8565dde
 
-Authentication token: `68af26a155e25501`
+Authentication token: `abe24ec533283049`
 
 
 The archive contains a build for each of the following platforms:
@@ -487,7 +487,7 @@ The host agent code is tested with three test suites:
   tests. This works great for the user-land portion of the agent, but is unable
   to test any of the unwinding logic and BPF interaction.
 - **coredump test suite**\
-  The coredump test suite (`utils/coredump`) we compile the whole BPF unwinder
+  The coredump test suite (`tools/coredump`) we compile the whole BPF unwinder
   code into a user-mode executable, then use the information from a coredump to
   simulate a realistic environment to test the unwinder code in. The coredump
   suite essentially implements all required BPF helper functions in user-space,

@@ -15,7 +15,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/xsync"
 	"go.opentelemetry.io/ebpf-profiler/reporter/internal/pdata"
-	"go.opentelemetry.io/ebpf-profiler/reporter/internal/samples"
+	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/support"
 )
 
@@ -105,15 +105,15 @@ func (r *CollectorReporter) Start(ctx context.Context) error {
 	return nil
 }
 
-func (r *CollectorReporter) GetMetrics() Metrics {
-	return Metrics{}
-}
-
 // reportProfile creates and sends out a profile.
 func (r *CollectorReporter) reportProfile(ctx context.Context) error {
 	traceEvents := r.traceEvents.WLock()
-	events := maps.Clone(*traceEvents)
-	clear(*traceEvents)
+	events := make(map[libpf.Origin]samples.KeyToEventMapping, 2)
+	for _, origin := range []libpf.Origin{support.TraceOriginSampling,
+		support.TraceOriginOffCPU} {
+		events[origin] = maps.Clone((*traceEvents)[origin])
+		clear((*traceEvents)[origin])
+	}
 	r.traceEvents.WUnlock(&traceEvents)
 
 	profiles := r.pdata.Generate(events)

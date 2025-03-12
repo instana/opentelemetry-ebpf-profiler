@@ -1,6 +1,6 @@
 .PHONY: all all-common clean ebpf generate test test-deps protobuf docker-image agent legal \
 	integration-test-binaries codespell lint linter-version debug debug-agent ebpf-profiler \
-	format-ebpf
+	format-ebpf rust-components rust-targets rust-tests vanity-import-check vanity-import-fix
 
 SHELL := /usr/bin/env bash
 
@@ -78,15 +78,17 @@ clean:
 	@$(MAKE) -s -C support/ebpf clean
 	@rm -f support/*.test
 	@chmod -Rf u+w go/ || true
-	@rm -rf go/pkg go/.cache .cache
+	@rm -rf go .cache
+	@cargo clean
 
 generate:
 	GOARCH=$(NATIVE_ARCH) go generate ./...
+	(cd support && ./generate.sh)
 
-ebpf:
+ebpf: generate
 	$(MAKE) $(EBPF_FLAGS) -C support/ebpf
 
-ebpf-profiler: generate ebpf
+ebpf-profiler: generate ebpf rust-components
 	go build $(GO_FLAGS) -tags $(GO_TAGS)
 
 PROTOC_GEN_VERSION = "v1.31.0"
@@ -109,6 +111,24 @@ clean-go-deps: clean
 	@rm go/bin/porto*
 	@rm go/bin/golang*
 
+rust-targets:
+ifeq ($(TARGET_ARCH),arm64)
+	rustup target add aarch64-unknown-linux-musl
+else ifeq ($(TARGET_ARCH),amd64)
+	rustup target add x86_64-unknown-linux-musl
+endif
+
+rust-components: rust-targets
+ifeq ($(TARGET_ARCH),arm64)
+	cargo build --lib --release --target aarch64-unknown-linux-musl
+else ifeq ($(TARGET_ARCH),amd64)
+	cargo build --lib --release --target x86_64-unknown-linux-musl
+endif
+
+rust-tests: rust-targets
+	cargo test
+
+GOLANGCI_LINT_VERSION = "v1.64.5"
 lint: generate vanity-import-check
 	$(MAKE) lint -C support/ebpf
 	golangci-lint version
@@ -121,11 +141,9 @@ linter-version:
 	@echo golangci-lint version: $(GOLANGCI_LINT_VERSION)
 	@echo porto version: $(PORTO_VERSION)
 
-.PHONY: vanity-import-check
 vanity-import-check:
 	@porto --include-internal -l . || ( echo "(run: make vanity-import-fix)"; exit 1 )
 
-.PHONY: vanity-import-fix
 vanity-import-fix: $(PORTO)
 	@porto --include-internal -w .
 

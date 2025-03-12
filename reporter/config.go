@@ -8,7 +8,7 @@ import (
 
 	"google.golang.org/grpc"
 
-	"go.opentelemetry.io/ebpf-profiler/reporter/internal/samples"
+	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 )
 
 type Config struct {
@@ -57,4 +57,8 @@ type Config struct {
 	// ExtraSampleAttrProd is an optional hook point for adding custom
 	// attributes to samples.
 	ExtraSampleAttrProd samples.SampleAttrProducer
+
+	// GRPCDialOptions allows passing additional gRPC dial options when establishing
+	// the connection to the collector. These options are appended after the default options.
+	GRPCDialOptions []grpc.DialOption
 }

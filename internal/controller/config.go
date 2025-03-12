@@ -8,7 +8,9 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+
 	"go.opentelemetry.io/ebpf-profiler/reporter"
+	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/tracer"
 )
 
@@ -30,11 +32,7 @@ type Config struct {
 	Tracers                string
 	VerboseMode            bool
 	Version                bool
-	// HostName is the name of the host.
-	HostName string
-	// IPAddress is the IP address of the host that sends data to CollAgentAddr.
-	IPAddress       string
-	OffCPUThreshold uint
+	OffCPUThreshold        uint
 
 	Reporter reporter.Reporter
 
@@ -86,6 +84,14 @@ func (cfg *Config) Validate() error {
 			"invalid argument for probabilistic-threshold. Value "+
 				"should be between 1 and %d",
 			tracer.ProbabilisticThresholdMax,
+		)
+	}
+
+	if cfg.OffCPUThreshold > support.OffCPUThresholdMax {
+		return fmt.Errorf(
+			"invalid argument for off-cpu-threshold. Value "+
+				"should be between 1 and %d, or 0 to disable off-cpu profiling",
+			support.OffCPUThresholdMax,
 		)
 	}
 

@@ -46,7 +46,7 @@ RUN                                                                             
   PB_FILE="protoc-24.4-linux-x86_64.zip";                                          \
   INSTALL_DIR="/usr/local";                                                        \
                                                                                    \
-  wget -q "$PB_URL/$PB_FILE"                                                       \
+  wget -nv "$PB_URL/$PB_FILE"                                                       \
     && unzip "$PB_FILE" -d "$INSTALL_DIR" 'bin/*' 'include/*'                      \
     && chmod +xr "$INSTALL_DIR/bin/protoc"                                         \
     && find "$INSTALL_DIR/include" -type d -exec chmod +x {} \;                    \
@@ -55,6 +55,25 @@ RUN                                                                             
 
 # Append to /etc/profile for login shells
 RUN echo 'export PATH="$PATH"' >> /etc/profile
+
+# Create rust related directories in /usr/local
+RUN mkdir -p /usr/local/cargo /usr/local/rustup
+
+# Set environment variable before rustup installation
+ENV CARGO_HOME=/usr/local/cargo
+ENV RUSTUP_HOME=/usr/local/rustup
+
+# Install rustup and cargo
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.77
+
+# Add rust related environment variables
+RUN echo 'export PATH="/usr/local/cargo/bin:$PATH"' >> /etc/profile     \
+    && echo 'export CARGO_HOME="/usr/local/cargo"' >> /etc/profile      \
+    && echo 'export RUSTUP_HOME="/usr/local/rustup"' >> /etc/profile
+
+# Set mode bits
+RUN chmod -R a+w /usr/local/rustup      \
+    && chmod -R a+w /usr/local/cargo
 
 WORKDIR /agent
 

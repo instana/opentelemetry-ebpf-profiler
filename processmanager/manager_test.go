@@ -3,7 +3,7 @@
 
 package processmanager
 
-// See also utils/coredump/coredump_test.go for core dump based testing.
+// See also tools/coredump/coredump_test.go for core dump based testing.
 
 import (
 	"context"
@@ -602,7 +602,7 @@ func TestProcExit(t *testing.T) {
 
 			populateManager(t, manager)
 
-			_ = manager.ProcessPIDExit(testcase.pid)
+			manager.processPIDExit(testcase.pid)
 			assert.Equal(t, testcase.deletePidPageMappingCount,
 				ebpfMockup.deletePidPageMappingCount)
 			assert.Equal(t, testcase.deleteStackDeltaRangesCount,

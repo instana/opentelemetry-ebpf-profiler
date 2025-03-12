@@ -13,16 +13,13 @@ import (
 	lru "github.com/elastic/go-freelru"
 	log "github.com/sirupsen/logrus"
 
+	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/times"
 
 	"go.opentelemetry.io/ebpf-profiler/host"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
 )
-
-// metadataWarnInhibDuration defines the minimum duration between warnings printed
-// about failure to obtain metadata for a single PID.
-const metadataWarnInhibDuration = 1 * time.Minute
 
 // Compile time check to make sure config.Times satisfies the interfaces.
 var _ Times = (*times.Times)(nil)
@@ -46,11 +43,11 @@ type TraceProcessor interface {
 	// the frame and send the associated metadata to the collection agent.
 	ConvertTrace(trace *host.Trace) *libpf.Trace
 
-	// SymbolizationComplete is called after a group of Trace has been symbolized.
+	// ProcessedUntil is called periodically after Traces are processed/symbolized.
 	// It gets the timestamp of when the Traces (if any) were captured. The timestamp
 	// is in essence an indicator that all Traces until that time have been now processed,
-	// and any events up to this time can be processed.
-	SymbolizationComplete(traceCaptureKTime times.KTime)
+	// and any events and cleanup actions up to this time can be processed.
+	ProcessedUntil(traceCaptureKTime times.KTime)
 }
 
 // traceHandler provides functions for handling new traces and trace count updates
@@ -76,10 +73,6 @@ type traceHandler struct {
 	// reporter instance to use to send out traces.
 	reporter reporter.TraceReporter
 
-	// metadataWarnInhib tracks inhibitions for warnings printed about failure to
-	// update container metadata (rate-limiting).
-	metadataWarnInhib *lru.LRU[libpf.PID, libpf.Void]
-
 	times Times
 }
 
@@ -98,33 +91,20 @@ func newTraceHandler(rep reporter.TraceReporter, traceProcessor TraceProcessor,
 		return nil, err
 	}
 
-	metadataWarnInhib, err := lru.New[libpf.PID, libpf.Void](64, libpf.PID.Hash32)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create metadata warning inhibitor LRU: %v", err)
-	}
-	metadataWarnInhib.SetLifetime(metadataWarnInhibDuration)
-
 	t := &traceHandler{
-		traceProcessor:    traceProcessor,
-		bpfTraceCache:     bpfTraceCache,
-		umTraceCache:      umTraceCache,
-		reporter:          rep,
-		times:             intervals,
-		metadataWarnInhib: metadataWarnInhib,
+		traceProcessor: traceProcessor,
+		bpfTraceCache:  bpfTraceCache,
+		umTraceCache:   umTraceCache,
+		reporter:       rep,
+		times:          intervals,
 	}
 
 	return t, nil
 }
 
 func (m *traceHandler) HandleTrace(bpfTrace *host.Trace) {
-	if bpfTrace == nil {
-		return
-	}
-	defer m.traceProcessor.SymbolizationComplete(bpfTrace.KTime)
-	timestamp := libpf.UnixTime64(bpfTrace.KTime.UnixNano())
-
-	meta := &reporter.TraceEventMeta{
-		Timestamp:      timestamp,
+	meta := &samples.TraceEventMeta{
+		Timestamp:      libpf.UnixTime64(bpfTrace.KTime.UnixNano()),
 		Comm:           bpfTrace.Comm,
 		PID:            bpfTrace.PID,
 		TID:            bpfTrace.TID,
@@ -197,7 +177,9 @@ func Start(ctx context.Context, rep reporter.TraceReporter, traceProcessor Trace
 		for {
 			select {
 			case traceUpdate := <-traceInChan:
-				handler.HandleTrace(traceUpdate)
+				if traceUpdate != nil {
+					handler.HandleTrace(traceUpdate)
+				}
 			case <-metricsTicker.C:
 				handler.collectMetrics()
 			case <-ctx.Done():
