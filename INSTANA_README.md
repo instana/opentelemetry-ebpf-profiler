@@ -130,6 +130,28 @@ To create n patches from the last tag, apply the following command:
 git format-patch -<n> HEAD
 ```
 You will notice that <n> files are created.
+You want to create patches for all the commits done after the last synch.
+Example
+If the following is the top of your git history:
+6bc0800 Teresa Noviello 2025-03-18_08:51:17  "INSTANA_README: fix tag creation, add patching/release info"
+5cab070 Teresa Noviello 2025-01-29_12:44:48  "README: add BUILD_IMAGE, BUILD_ENV info (#15)"
+3939695 Teresa Noviello 2025-01-27_17:37:47  "INSTA-16822: Lint update toolchain: Bump golangci-lint to 1.63.4, install clang-format-17 (#14)"
+35b4183 Teresa Noviello 2025-01-24_16:22:36  "Makefile: specify the build image, the tty interactive (#13)"
+270db14 Teresa Noviello 2025-01-21_12:23:16  "Sync from upstream (2025-01-17) (#11)"
+You do want to create 4 patches, 1 for every commit after the commit "Sync from upstream (2025-01-17) (#11)".`
+So you run:
+```
+git format-patch -4 HEAD
+```
+output:
+```
+0001-Makefile-specify-the-build-image-the-tty-interactive.patch
+0002-INSTA-16822-Lint-update-toolchain-Bump-golangci-lint.patch
+0003-README-add-BUILD_IMAGE-BUILD_ENV-info-15.patch
+0004-INSTANA_README-fix-tag-creation-add-patching-release.patch
+```
+Now you need to add the patches to the correct repository.
+
 Clone locally the repository https://github.ibm.com/instana/ebpf-profiler-cicd, create a branch checking-out from `main` branch and add the patch file(s) in the directory `patches`, paying attention to:
 1. Substitute the hyphens with underscores
 2. Simplify the file name
