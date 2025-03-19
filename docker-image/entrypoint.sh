@@ -22,6 +22,8 @@ export GOCACHE
 export GOBIN
 export PATH
 export GOLANGCI_LINT_CACHE
+export CC
+export CXX
 
 git config --global --add safe.directory /agent
 

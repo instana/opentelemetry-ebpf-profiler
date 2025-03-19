@@ -5,20 +5,28 @@ FROM ${image}
 WORKDIR /agent-go
 
 RUN apt-get update -y \
-    && apt-get install -y --no-install-recommends --no-install-suggests \
+    && apt-get install -y software-properties-common \
+    && apt update -y \
+    && add-apt-repository universe \
+    && apt-get install -y build-essential \
         ca-certificates \
         gnupg2 \
-        software-properties-common \
         wget \
         git \
         findutils \
         unzip \
-        make
+        make \
+        curl \
+        musl-dev \
+        cmake
 
-RUN wget https://apt.llvm.org/llvm.sh \
-    && chmod +x llvm.sh \
-    && ./llvm.sh 17 \
-    && apt install clang-format-17
+
+ENV CLANG_VERSION="17"
+ENV CXX=clang++-"$CLANG_VERSION"
+ENV CC=clang-"$CLANG_VERSION"
+RUN wget -O - https://apt.llvm.org/llvm.sh | bash -s ${CLANG_VERSION} \
+    && echo "export CXX=clang++-$CLANG_VERSION" >> /root/.bashrc \
+    && echo "export CC=clang-$CLANG_VERSION" >> /root/.bashrc
 
 COPY go.mod /tmp/go.mod
 # Extract Go version from go.mod
@@ -70,6 +78,8 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --pr
 RUN echo 'export PATH="/usr/local/cargo/bin:$PATH"' >> /etc/profile     \
     && echo 'export CARGO_HOME="/usr/local/cargo"' >> /etc/profile      \
     && echo 'export RUSTUP_HOME="/usr/local/rustup"' >> /etc/profile
+
+ENV PATH="$PATH:/usr/local/cargo/bin"
 
 # Set mode bits
 RUN chmod -R a+w /usr/local/rustup      \
