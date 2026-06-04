@@ -1,7 +1,7 @@
 {
   "settingsInheritedFrom": "whitesource-config/whitesource-config@master",
   "issueSettings": {
-    "minSeverityLevel": "NONE"
+    "minSeverityLevel": "LOW"
   },
   "scanSettings": {
    "configMode": "LOCAL"
