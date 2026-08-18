@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -39,14 +40,14 @@ type apmAgentSocket struct {
 func openAPMAgentSocket(pid libpf.PID, socketPath string) (*apmAgentSocket, error) {
 	// Ensure that the socket path can't escape our root.
 	socketPath = filepath.Clean(socketPath)
-	for _, segment := range strings.Split(socketPath, "/") {
-		if segment == ".." {
+	for part := range strings.SplitSeq(socketPath, "/") {
+		if part == ".." {
 			return nil, errors.New("socket path escapes root")
 		}
 	}
 
 	// Prepend root system to ensure that this also works with containerized apps.
-	socketPath = fmt.Sprintf("/proc/%d/root/%s", pid, socketPath)
+	socketPath = path.Join("/proc", strconv.Itoa(int(pid)), "root", socketPath)
 
 	// Read effective UID/GID of the APM agent process.
 	euid, egid, err := readProcessOwner(pid)
@@ -163,7 +164,7 @@ func parseUIDGIDLine(line string) (uint32, error) {
 	}
 
 	// Fields: real, effective, saved, FS UID
-	eid, err := strconv.Atoi(fields[2])
+	eid, err := strconv.ParseUint(fields[2], 10, 32)
 	if err != nil {
 		return 0, fmt.Errorf("failed to parse uid/gid int: %v", err)
 	}

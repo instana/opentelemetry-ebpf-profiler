@@ -6,7 +6,6 @@ package times // import "go.opentelemetry.io/ebpf-profiler/times"
 import (
 	"context"
 	"runtime"
-	"sort"
 	"sync/atomic"
 	"time"
 
@@ -43,13 +42,13 @@ type Times struct {
 	monitorInterval           time.Duration
 	tracePollInterval         time.Duration
 	reportInterval            time.Duration
-	reportMetricsInterval     time.Duration
 	grpcConnectionTimeout     time.Duration
 	grpcOperationTimeout      time.Duration
 	grpcStartupBackoffTimeout time.Duration
 	grpcAuthErrorDelay        time.Duration
 	pidCleanupInterval        time.Duration
 	probabilisticInterval     time.Duration
+	executableUnloadDelay     time.Duration
 }
 
 // IntervalsAndTimers is a meta-interface that exists purely to document its functionality.
@@ -60,9 +59,6 @@ type IntervalsAndTimers interface {
 	TracePollInterval() time.Duration
 	// ReportInterval defines the interval at which collected data is sent to collection agent.
 	ReportInterval() time.Duration
-	// ReportMetricsInterval defines the interval at which collected metrics are sent
-	// to collection agent.
-	ReportMetricsInterval() time.Duration
 	// GRPCConnectionTimeout defines the timeout for each established gRPC connection.
 	GRPCConnectionTimeout() time.Duration
 	// GRPCOperationTimeout defines the timeout for each gRPC operation.
@@ -79,6 +75,9 @@ type IntervalsAndTimers interface {
 	// ProbabilisticInterval defines the interval for which probabilistic profiling will
 	// be enabled or disabled.
 	ProbabilisticInterval() time.Duration
+	// ExecutableUnloadDelay defines how long to wait after an executable is no longer used
+	// before unloading it from memory.
+	ExecutableUnloadDelay() time.Duration
 }
 
 func (t *Times) MonitorInterval() time.Duration { return t.monitorInterval }
@@ -86,8 +85,6 @@ func (t *Times) MonitorInterval() time.Duration { return t.monitorInterval }
 func (t *Times) TracePollInterval() time.Duration { return t.tracePollInterval }
 
 func (t *Times) ReportInterval() time.Duration { return t.reportInterval }
-
-func (t *Times) ReportMetricsInterval() time.Duration { return t.reportMetricsInterval }
 
 func (t *Times) GRPCConnectionTimeout() time.Duration { return t.grpcConnectionTimeout }
 
@@ -100,6 +97,8 @@ func (t *Times) GRPCAuthErrorDelay() time.Duration { return t.grpcAuthErrorDelay
 func (t *Times) PIDCleanupInterval() time.Duration { return t.pidCleanupInterval }
 
 func (t *Times) ProbabilisticInterval() time.Duration { return t.probabilisticInterval }
+
+func (t *Times) ExecutableUnloadDelay() time.Duration { return t.executableUnloadDelay }
 
 // StartRealtimeSync calculates a delta between the monotonic clock
 // (CLOCK_MONOTONIC, rebased to unixtime) and the realtime clock. If syncInterval is
@@ -117,7 +116,6 @@ func StartRealtimeSync(ctx context.Context, syncInterval time.Duration) {
 // New returns a new Times instance.
 func New(reportInterval, monitorInterval, probabilisticInterval time.Duration) *Times {
 	return &Times{
-		reportMetricsInterval:     1 * time.Minute,
 		grpcAuthErrorDelay:        GRPCAuthErrorDelay,
 		grpcConnectionTimeout:     GRPCConnectionTimeout,
 		grpcOperationTimeout:      GRPCOperationTimeout,
@@ -127,6 +125,7 @@ func New(reportInterval, monitorInterval, probabilisticInterval time.Duration) *
 		reportInterval:            reportInterval,
 		monitorInterval:           monitorInterval,
 		probabilisticInterval:     probabilisticInterval,
+		executableUnloadDelay:     5 * time.Minute,
 	}
 }
 
@@ -150,18 +149,19 @@ func getBootTimeUnixNano() int64 {
 		samples[i].t2 = time.Now()
 	}
 
-	sort.Slice(samples, func(i, j int) bool {
-		di := samples[i].t2.UnixNano() - samples[i].t1.UnixNano()
-		dj := samples[j].t2.UnixNano() - samples[j].t1.UnixNano()
-		if di < 0 {
-			di = -di
+	// Find the index with minimal time delta
+	md := int64(^uint64(0) >> 1) // same as math.MaxInt64
+	mi := 0
+	for i := range samples {
+		delta := samples[i].t2.UnixNano() - samples[i].t1.UnixNano()
+		if delta < 0 {
+			delta = -delta
 		}
-		if dj < 0 {
-			dj = -dj
+		if delta < md {
+			md = delta
+			mi = i
 		}
-		return di < dj
-	})
-
+	}
 	// This should never be negative, as t1.UnixNano() >> ktime
-	return samples[0].t1.UnixNano() - samples[0].ktime
+	return samples[mi].t1.UnixNano() - samples[mi].ktime
 }

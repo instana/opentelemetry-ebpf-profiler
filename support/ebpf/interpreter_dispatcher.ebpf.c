@@ -3,6 +3,7 @@
 // perf event and will call the appropriate tracer for a given process
 
 #include "bpfdefs.h"
+#include "kernel.h"
 #include "tracemgmt.h"
 #include "tsd.h"
 #include "types.h"
@@ -10,42 +11,42 @@
 // Begin shared maps
 
 // Per-CPU record of the stack being built and meta-data on the building process
-bpf_map_def SEC("maps") per_cpu_records = {
-  .type        = BPF_MAP_TYPE_PERCPU_ARRAY,
-  .key_size    = sizeof(int),
-  .value_size  = sizeof(PerCPURecord),
-  .max_entries = 1,
-};
+struct per_cpu_records_t {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, int);
+  __type(value, PerCPURecord);
+  __uint(max_entries, 1);
+} per_cpu_records SEC(".maps");
 
 // metrics maps metric ID to a value
-bpf_map_def SEC("maps") metrics = {
-  .type        = BPF_MAP_TYPE_PERCPU_ARRAY,
-  .key_size    = sizeof(u32),
-  .value_size  = sizeof(u64),
-  .max_entries = metricID_Max,
-};
+struct metrics_t {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, u32);
+  __type(value, u64);
+  __uint(max_entries, metricID_Max);
+} metrics SEC(".maps");
 
 // perf_progs maps from a program ID to a perf eBPF program
-bpf_map_def SEC("maps") perf_progs = {
-  .type        = BPF_MAP_TYPE_PROG_ARRAY,
-  .key_size    = sizeof(u32),
-  .value_size  = sizeof(u32),
-  .max_entries = NUM_TRACER_PROGS,
-};
+struct perf_progs_t {
+  __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+  __type(key, u32);
+  __type(value, u32);
+  __uint(max_entries, NUM_TRACER_PROGS);
+} perf_progs SEC(".maps");
 
-// report_events notifies user space about events (GENERIC_PID and TRACES_FOR_SYMBOLIZATION).
+// report_events notifies user space about events (GENERIC_PID).
 //
 // As a key the CPU number is used and the value represents a perf event file descriptor.
 // Information transmitted is the event type only. We use 0 as the number of max entries
 // for this map as at load time it will be replaced by the number of possible CPUs. At
 // the same time this will then also define the number of perf event rings that are
 // used for this map.
-bpf_map_def SEC("maps") report_events = {
-  .type        = BPF_MAP_TYPE_PERF_EVENT_ARRAY,
-  .key_size    = sizeof(int),
-  .value_size  = sizeof(u32),
-  .max_entries = 0,
-};
+struct report_events_t {
+  __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+  __type(key, int);
+  __type(value, u32);
+  __uint(max_entries, 0);
+} report_events SEC(".maps");
 
 // reported_pids is a map that holds PIDs recently reported to user space.
 //
@@ -55,41 +56,41 @@ bpf_map_def SEC("maps") report_events = {
 // be stored, without immediately being removed, that we would like to support. PIDs are
 // either left to expire from the LRU or updated based on the rate limit token. Note that
 // timeout checks are done lazily on access, so this map may contain multiple expired PIDs.
-bpf_map_def SEC("maps") reported_pids = {
-  .type        = BPF_MAP_TYPE_LRU_HASH,
-  .key_size    = sizeof(u32),
-  .value_size  = sizeof(u64),
-  .max_entries = 65536,
-};
+struct reported_pids_t {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __type(key, u32);
+  __type(value, u64);
+  __uint(max_entries, 65536);
+} reported_pids SEC(".maps");
 
 // pid_events is a map that holds PIDs that should be processed in user space.
 //
 // User space code will periodically iterate through the map and process each entry.
 // Additionally, each time eBPF code writes a value into the map, user space is notified
-// through event_send_trigger (which uses maps/report_events). As key we use the PID of
-// the process and as value always true. When sizing this map, we are thinking about
-// the maximum number of unique PIDs that could generate events we're interested in
-// (process new, process exit, unknown PC) within a map monitor/processing interval,
+// through event_send_trigger (which uses maps/report_events). As key we use the PID/TID
+// of the process/thread and as value always true. When sizing this map, we are thinking
+// about the maximum number of unique PIDs that could generate events we're interested in
+// (process new, thread group exit, unknown PC) within a map monitor/processing interval,
 // that we would like to support.
-bpf_map_def SEC("maps") pid_events = {
-  .type        = BPF_MAP_TYPE_HASH,
-  .key_size    = sizeof(u32),
-  .value_size  = sizeof(bool),
-  .max_entries = 65536,
-};
+struct pid_events_t {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, u64);
+  __type(value, bool);
+  __uint(max_entries, 65536);
+} pid_events SEC(".maps");
 
 // The native unwinder needs to be able to determine how each mapping should be unwound.
 //
 // This map contains data to help the native unwinder translate from a virtual address in a given
 // process. It contains information of the unwinder program to use, how to convert the virtual
 // address to relative address, and what executable file is in question.
-bpf_map_def SEC("maps") pid_page_to_mapping_info = {
-  .type        = BPF_MAP_TYPE_LPM_TRIE,
-  .key_size    = sizeof(PIDPage),
-  .value_size  = sizeof(PIDPageMappingInfo),
-  .max_entries = 524288, // 2^19
-  .map_flags   = BPF_F_NO_PREALLOC,
-};
+struct pid_page_to_mapping_info_t {
+  __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+  __type(key, PIDPage);
+  __type(value, PIDPageMappingInfo);
+  __uint(max_entries, 524288); // 2^19
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+} pid_page_to_mapping_info SEC(".maps");
 
 // inhibit_events map is used to inhibit sending events to user space.
 //
@@ -98,33 +99,126 @@ bpf_map_def SEC("maps") pid_page_to_mapping_info = {
 // trigger, so next event is sent when needed.
 // NOTE: Update .max_entries if additional event types are added. The value should
 // equal the number of different event types using this mechanism.
-bpf_map_def SEC("maps") inhibit_events = {
-  .type        = BPF_MAP_TYPE_HASH,
-  .key_size    = sizeof(u32),
-  .value_size  = sizeof(bool),
-  .max_entries = 2,
-};
+struct inhibit_events_t {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, u32);
+  __type(value, bool);
+  __uint(max_entries, 2);
+} inhibit_events SEC(".maps");
 
-// Perf event ring buffer for sending completed traces to user-mode.
+// Ring buffer for sending completed traces to userspace.
 //
 // The map is periodically polled and read from in `tracer`.
-bpf_map_def SEC("maps") trace_events = {
-  .type        = BPF_MAP_TYPE_PERF_EVENT_ARRAY,
-  .key_size    = sizeof(int),
-  .value_size  = 0,
-  .max_entries = 0,
-};
+// NOTE: We use 0 as the number of max entries for this map as at load time
+// it will be adjusted based on the number of possible CPUs, sampling rate and
+// other factors.
+struct trace_events_t {
+  __uint(type, BPF_MAP_TYPE_RINGBUF);
+  __uint(max_entries, 0);
+} trace_events SEC(".maps");
 
 // End shared maps
 
-bpf_map_def SEC("maps") apm_int_procs = {
-  .type        = BPF_MAP_TYPE_HASH,
-  .key_size    = sizeof(pid_t),
-  .value_size  = sizeof(ApmIntProcInfo),
-  .max_entries = 128,
-};
+// Implements the specification to share span/trace IDs according to:
+// https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/blob/main/devdocs/trace-profile-correlation.md
+struct traces_ctx_v1_t {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __type(key, u64);
+  __type(value, SpanTraceInfo);
+  __uint(max_entries, 1 << 14);
+} traces_ctx_v1 SEC(".maps");
 
-static inline __attribute__((__always_inline__)) void maybe_add_apm_info(Trace *trace)
+struct apm_int_procs_t {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, pid_t);
+  __type(value, ApmIntProcInfo);
+  __uint(max_entries, 128);
+} apm_int_procs SEC(".maps");
+
+// filter_error_frames is set during load time.
+BPF_RODATA_VAR(bool, filter_error_frames, false)
+
+static EBPF_INLINE void *get_m_ptr(struct GoLabelsOffsets *offs, UNUSED UnwindState *state)
+{
+  u64 g_addr     = 0;
+  void *tls_base = NULL;
+  if (tsd_get_base(&tls_base) < 0) {
+    DEBUG_PRINT("cl: failed to get tsd base; can't read m_ptr");
+    return NULL;
+  }
+  DEBUG_PRINT(
+    "cl: read tsd_base at 0x%lx, g offset: %d", (unsigned long)tls_base, offs->tls_offset);
+
+  if (offs->tls_offset == 0) {
+#if defined(__aarch64__)
+    // On aarch64 for !iscgo programs the g is only stored in r28 register.
+    g_addr = state->r28;
+#elif defined(__x86_64__)
+    DEBUG_PRINT("cl: TLS offset for g pointer missing for amd64");
+    return NULL;
+#endif
+  }
+
+  if (g_addr == 0) {
+    if (bpf_probe_read_user(&g_addr, sizeof(void *), (void *)((s64)tls_base + offs->tls_offset))) {
+      DEBUG_PRINT("cl: failed to read g_addr, tls_base(%lx)", (unsigned long)tls_base);
+      return NULL;
+    }
+  }
+
+  DEBUG_PRINT("cl: reading m_ptr_addr at 0x%lx + 0x%x", (unsigned long)g_addr, offs->m_offset);
+  void *m_ptr_addr;
+  if (bpf_probe_read_user(&m_ptr_addr, sizeof(void *), (void *)(g_addr + offs->m_offset))) {
+    DEBUG_PRINT("cl: failed m_ptr_addr");
+    return NULL;
+  }
+  DEBUG_PRINT("cl: m_ptr_addr 0x%lx", (unsigned long)m_ptr_addr);
+  return m_ptr_addr;
+}
+
+static EBPF_INLINE void maybe_add_go_custom_labels(struct pt_regs *ctx, PerCPURecord *record)
+{
+  u32 pid                  = record->trace.pid;
+  GoLabelsOffsets *offsets = bpf_map_lookup_elem(&go_labels_procs, &pid);
+  if (!offsets) {
+    DEBUG_PRINT("cl: no offsets, %d not recognized as a go binary", pid);
+    return;
+  }
+
+  void *m_ptr_addr = get_m_ptr(offsets, &record->state);
+  if (!m_ptr_addr) {
+    return;
+  }
+  record->customLabelsState.go_m_ptr = m_ptr_addr;
+
+  DEBUG_PRINT("cl: trace is within a process with Go custom labels enabled");
+  increment_metric(metricID_UnwindGoLabelsAttempts);
+  // The Go label extraction code is too big to fit in the UNWIND_STOP program, so
+  // it is tail_call'd.
+  tail_call(ctx, PROG_GO_LABELS);
+}
+
+// Implements the specification to share span/trace IDs according to:
+// https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/blob/main/devdocs/trace-profile-correlation.md
+static EBPF_INLINE void maybe_add_otel_span_trace_id(Trace *trace)
+{
+  u64 id = bpf_get_current_pid_tgid();
+
+  SpanTraceInfo *info = bpf_map_lookup_elem(&traces_ctx_v1, &id);
+  if (!info) {
+    return;
+  }
+
+  // The structure of apm_[transaction|trace]_id happens to be the same
+  // as proposed in
+  // https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/blob/main/devdocs/trace-profile-correlation.md
+
+  trace->apm_trace_id.as_int.hi    = info->trace_id.as_int.hi;
+  trace->apm_trace_id.as_int.lo    = info->trace_id.as_int.lo;
+  trace->apm_transaction_id.as_int = info->span_id.as_int;
+}
+
+static EBPF_INLINE void maybe_add_apm_info(Trace *trace)
 {
   u32 pid              = trace->pid; // verifier needs this to be on stack on 4.15 kernel
   ApmIntProcInfo *proc = bpf_map_lookup_elem(&apm_int_procs, &pid);
@@ -174,7 +268,7 @@ static inline __attribute__((__always_inline__)) void maybe_add_apm_info(Trace *
 }
 
 // unwind_stop is the tail call destination for PROG_UNWIND_STOP.
-static inline __attribute__((__always_inline__)) int unwind_stop(struct pt_regs *ctx)
+static EBPF_INLINE int unwind_stop(struct pt_regs *ctx)
 {
   PerCPURecord *record = get_per_cpu_record();
   if (!record)
@@ -183,10 +277,16 @@ static inline __attribute__((__always_inline__)) int unwind_stop(struct pt_regs 
   UnwindState *state = &record->state;
 
   maybe_add_apm_info(trace);
+  if (
+    trace->apm_trace_id.as_int.hi == 0 && trace->apm_trace_id.as_int.lo == 0 &&
+    trace->apm_transaction_id.as_int == 0) {
+    // Populate OTel span/trace ID only if span/trace ID is not yet set.
+    maybe_add_otel_span_trace_id(trace);
+  }
 
   // If the stack is otherwise empty, push an error for that: we should
   // never encounter empty stacks for successful unwinding.
-  if (trace->stack_len == 0 && trace->kernel_stack_id < 0) {
+  if (trace->frame_data_len == 0) {
     DEBUG_PRINT("unwind_stop called but the stack is empty");
     increment_metric(metricID_ErrEmptyStack);
     if (!state->unwind_error) {
@@ -197,7 +297,7 @@ static inline __attribute__((__always_inline__)) int unwind_stop(struct pt_regs 
   // If unwinding was aborted due to a critical error, push an error frame.
   if (state->unwind_error) {
     DEBUG_PRINT("Aborting further unwinding due to error code %d", state->unwind_error);
-    push_error(&record->trace, state->unwind_error);
+    push_abort(trace, state->unwind_error);
   }
 
   switch (state->error_metric) {
@@ -205,10 +305,11 @@ static inline __attribute__((__always_inline__)) int unwind_stop(struct pt_regs 
     // No Error
     break;
   case metricID_UnwindNativeErrWrongTextSection:;
-    if (report_pid(ctx, trace->pid, record->ratelimitAction)) {
+    u64 pid_tgid = (u64)trace->pid << 32 | trace->tid;
+    if (report_pid(ctx, pid_tgid, record->ratelimitAction)) {
       increment_metric(metricID_NumUnknownPC);
     }
-    // Fallthrough to report the error
+    // fallthrough
   default: increment_metric(state->error_metric);
   }
 
@@ -222,18 +323,15 @@ static inline __attribute__((__always_inline__)) int unwind_stop(struct pt_regs 
   // through different data structures, we'd have to keep a list of known empty traces to
   // also prevent the corresponding trace counts to be sent out. OTOH, if we do it here,
   // this is trivial.
-  if (trace->stack_len == 1 && trace->kernel_stack_id < 0 && state->unwind_error) {
-    u32 syscfg_key       = 0;
-    SystemConfig *syscfg = bpf_map_lookup_elem(&system_config, &syscfg_key);
-    if (!syscfg) {
-      return -1; // unreachable
-    }
-
-    if (syscfg->drop_error_only_traces) {
+  if (trace->frame_data_len == 1 && state->unwind_error) {
+    if (filter_error_frames) {
       return 0;
     }
   }
   // TEMPORARY HACK END
+
+  // Must be last since it may not return (it will call send_trace).
+  maybe_add_go_custom_labels(ctx, record);
 
   send_trace(ctx, trace);
 
@@ -242,6 +340,3 @@ static inline __attribute__((__always_inline__)) int unwind_stop(struct pt_regs 
 MULTI_USE_FUNC(unwind_stop)
 
 char _license[] SEC("license") = "GPL";
-// this number will be interpreted by the elf loader
-// to set the current running kernel version
-u32 _version SEC("version")    = 0xFFFFFFFE;

@@ -115,12 +115,13 @@ package php // import "go.opentelemetry.io/ebpf-profiler/interpreter/php"
 //     use the TSRM shouldn't encounter any issues here. There are other uncommon ways to build PHP, but these also shouldn't affect how this code works.
 
 import (
+	"debug/elf"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"regexp"
 
-	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
 
 	"go.opentelemetry.io/ebpf-profiler/interpreter"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
@@ -142,7 +143,7 @@ var (
 )
 
 type opcacheData struct {
-	version uint
+	version uint32
 
 	// dasmBuf is the address of the shared memory that is used for the JIT'd code.
 	// This is defined here:
@@ -192,7 +193,8 @@ func (i *opcacheInstance) Detach(ebpf interpreter.EbpfHandler, pid libpf.PID) er
 }
 
 func (i *opcacheInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
-	_ reporter.SymbolReporter, pr process.Process, _ []process.Mapping) error {
+	_ reporter.ExecutableReporter, pr process.Process, _ []process.RawMapping,
+) error {
 	if i.prefixes != nil {
 		// Already attached
 		return nil
@@ -238,7 +240,8 @@ func (d *opcacheData) String() string {
 }
 
 func (d *opcacheData) Attach(_ interpreter.EbpfHandler, _ libpf.PID, bias libpf.Address,
-	rm remotememory.RemoteMemory) (interpreter.Instance, error) {
+	rm remotememory.RemoteMemory,
+) (interpreter.Instance, error) {
 	return &opcacheInstance{
 		d:    d,
 		rm:   rm,
@@ -246,7 +249,10 @@ func (d *opcacheData) Attach(_ interpreter.EbpfHandler, _ libpf.PID, bias libpf.
 	}, nil
 }
 
-func determineOPCacheVersion(ef *pfelf.File) (uint, error) {
+func (d *opcacheData) Unload(_ interpreter.EbpfHandler) {
+}
+
+func determineOPCacheVersion(ef *pfelf.File) (uint32, error) {
 	// In contrast to interpreterphp, the opcache actually contains
 	// a really straightforward way to recover the version. As the opcache
 	// is a Zend extension, it has to provide a version, which just so
@@ -308,18 +314,24 @@ func getOpcacheJITInfo(ef *pfelf.File) (dasmBuf, dasmSize libpf.Address, err err
 	// Note: zend_jit_unprotect was chosen because it immediately calls mprotect with
 	// dasm_buf as the first parameter, which should be in a register for both x86-64
 	// and ARM64.
-	zendJit, err := ef.LookupSymbolAddress("zend_jit_unprotect")
-	if err != nil {
-		return 0, 0, err
-	}
 
 	// We should only need 64 bytes, since this should be early in the instruction sequence.
-	code := make([]byte, 64)
-	if _, err = ef.ReadVirtualMemory(code, int64(zendJit)); err != nil {
-		return 0, 0, err
+	sym, code, err := ef.SymbolData("zend_jit_unprotect", 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("unable to read 'zend_jit_unprotect': %w", err)
 	}
-
-	dasmBufPtr, dasmSizePtr, err := retrieveJITBufferPtrWrapper(code, zendJit)
+	var (
+		dasmBufPtr  libpf.SymbolValue
+		dasmSizePtr libpf.SymbolValue
+	)
+	switch ef.Machine {
+	case elf.EM_AARCH64:
+		dasmBufPtr, dasmSizePtr, err = retrieveJITBufferPtrARM(code, sym.Address)
+	case elf.EM_X86_64:
+		dasmBufPtr, dasmSizePtr, err = retrieveJITBufferPtrx86(code, sym.Address)
+	default:
+		return 0, 0, fmt.Errorf("unsupported machine type: %s", ef.Machine)
+	}
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to extract DASM pointers: %w", err)
 	}
@@ -333,7 +345,8 @@ func getOpcacheJITInfo(ef *pfelf.File) (dasmBuf, dasmSize libpf.Address, err err
 }
 
 func OpcacheLoader(_ interpreter.EbpfHandler, info *interpreter.LoaderInfo) (
-	interpreter.Data, error) {
+	interpreter.Data, error,
+) {
 	if !opcacheRegex.MatchString(info.FileName()) {
 		return nil, nil
 	}

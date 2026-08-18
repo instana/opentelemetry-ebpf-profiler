@@ -4,7 +4,6 @@
 package hotspot // import "go.opentelemetry.io/ebpf-profiler/interpreter/hotspot"
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -12,12 +11,13 @@ import (
 	"reflect"
 	"strings"
 
-	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
 
 	"github.com/elastic/go-freelru"
 
 	"go.opentelemetry.io/ebpf-profiler/interpreter"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
+	"go.opentelemetry.io/ebpf-profiler/libpf/pfbufio"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/xsync"
 	"go.opentelemetry.io/ebpf-profiler/lpm"
@@ -104,7 +104,12 @@ type hotspotVMData struct {
 			// JDK -8: offset, JDK 9+: pointers, JDK 23+: offset
 			CodeBegin uint `name:"_code_begin,_code_offset"`
 			CodeEnd   uint `name:"_code_end,_data_offset"`
-			Size      uint `name:"_size"` // Only needed for JDK23+
+			// Needed for JDK23+ for layout calculation
+			Size uint `name:"_size"`
+			// JDK25+: the metadata is inside mutable data
+			RelocationSize  uint `name:"_relocation_size"`
+			MutableDataSize uint `name:"_mutable_data_size"`
+			MutableData     uint `name:"_mutable_data"`
 		}
 		CodeCache struct {
 			Heap      libpf.Address `name:"_heap"`
@@ -161,17 +166,18 @@ type hotspotVMData struct {
 			ConstMethod uint `name:"_constMethod"`
 		} `name:"Method,methodOopDesc"`
 		Nmethod struct { // .Sizeof >256
-			Sizeof             uint
-			CompileID          uint `name:"_compile_id"`
-			MetadataOffset     uint `name:"_metadata_offset,_oops_offset"`
-			ScopesPcsOffset    uint `name:"_scopes_pcs_offset"`
-			DependenciesOffset uint `name:"_dependencies_offset"` // JDK -22 only
-			ImmutableData      uint `name:"_immutable_data"`      // JDK 23+ only
-			ImmutableDataSize  uint `name:"_immutable_data_size"` // JDK 23+ only
-			OrigPcOffset       uint `name:"_orig_pc_offset"`
-			DeoptimizeOffset   uint `name:"_deoptimize_offset,_deopt_handler_offset,_deopt_handler_begin"`
-			Method             uint `name:"_method"`
-			ScopesDataOffset   uint `name:"_scopes_data_offset,_scopes_data_begin"`
+			Sizeof                   uint
+			CompileID                uint `name:"_compile_id"`
+			MetadataOffset           uint `name:"_metadata_offset,_oops_offset"`
+			ScopesPcsOffset          uint `name:"_scopes_pcs_offset"`
+			DependenciesOffset       uint `name:"_dependencies_offset"`             // JDK -22 only
+			ImmutableData            uint `name:"_immutable_data"`                  // JDK 23+ only
+			ImmutableDataSize        uint `name:"_immutable_data_size"`             // JDK 23+ only
+			ImmutableDataRefCountOff uint `name:"_immutable_data_ref_count_offset"` // JDK 26+ only
+			OrigPcOffset             uint `name:"_orig_pc_offset"`
+			DeoptimizeOffset         uint `name:"_deoptimize_offset,_deopt_handler_offset,_deopt_handler_begin,_deopt_handler_entry_offset"`
+			Method                   uint `name:"_method"`
+			ScopesDataOffset         uint `name:"_scopes_data_offset,_scopes_data_begin"`
 		} `name:"nmethod,CompiledMethod"`
 		OopDesc struct {
 			Sizeof uint
@@ -206,7 +212,7 @@ func fieldByJavaName(obj reflect.Value, fieldName string) reflect.Value {
 	for i := 0; i < obj.NumField(); i++ {
 		objField := objType.Field(i)
 		if nameTag, ok := objField.Tag.Lookup("name"); ok {
-			for _, javaName := range strings.Split(nameTag, ",") {
+			for javaName := range strings.SplitSeq(nameTag, ",") {
 				if fieldName == javaName {
 					return obj.Field(i)
 				}
@@ -227,7 +233,8 @@ func fieldByJavaName(obj reflect.Value, fieldName string) reflect.Value {
 // hotspotData.vmStructs using reflection to gather the offsets and sizes
 // we are interested about.
 func (vmd *hotspotVMData) parseIntrospection(it *hotspotIntrospectionTable,
-	rm remotememory.RemoteMemory, loadBias libpf.Address) error {
+	rm remotememory.RemoteMemory, loadBias libpf.Address,
+) error {
 	stride := libpf.Address(rm.Uint64(it.stride + loadBias))
 	typeOffs := uint(rm.Uint64(it.typeOffset + loadBias))
 	addrOffs := uint(rm.Uint64(it.addressOffset + loadBias))
@@ -337,48 +344,47 @@ func (d *hotspotData) String() string {
 // As the hotspot unwinder depends on the native unwinder, a part of the cleanup is done by the
 // process manager and not the corresponding Detach() function of hotspot objects.
 func (d *hotspotData) Attach(_ interpreter.EbpfHandler, _ libpf.PID, bias libpf.Address,
-	rm remotememory.RemoteMemory) (ii interpreter.Instance, err error) {
+	rm remotememory.RemoteMemory,
+) (ii interpreter.Instance, err error) {
 	// Each function has four symbols: source filename, class name,
 	// method name and signature. However, most of them are shared across
 	// different methods, so assume about 2 unique symbols per function.
-	addrToSymbol, err :=
-		freelru.New[libpf.Address, string](2*interpreter.LruFunctionCacheSize,
-			libpf.Address.Hash32)
+	addrToSymbol, err := freelru.New[libpf.Address, libpf.String](2*interpreter.LruFunctionCacheSize,
+		libpf.Address.Hash32)
 	if err != nil {
 		return nil, err
 	}
-	addrToMethod, err :=
-		freelru.New[libpf.Address, *hotspotMethod](interpreter.LruFunctionCacheSize,
-			libpf.Address.Hash32)
+	addrToMethod, err := freelru.New[libpf.Address, *hotspotMethod](interpreter.LruFunctionCacheSize,
+		libpf.Address.Hash32)
 	if err != nil {
 		return nil, err
 	}
-	addrToJITInfo, err :=
-		freelru.New[libpf.Address, *hotspotJITInfo](interpreter.LruFunctionCacheSize,
-			libpf.Address.Hash32)
+	addrToJITInfo, err := freelru.New[libpf.Address, *hotspotJITInfo](interpreter.LruFunctionCacheSize,
+		libpf.Address.Hash32)
 	if err != nil {
 		return nil, err
 	}
 	// In total there are about 100 to 200 intrinsics. We don't expect to encounter
 	// everyone single one. So we use a small cache size here than LruFunctionCacheSize.
-	addrToStubNameID, err :=
-		freelru.New[libpf.Address, libpf.AddressOrLineno](128,
-			libpf.Address.Hash32)
+	addrToStubName, err := freelru.New[libpf.Address, libpf.String](128, libpf.Address.Hash32)
 	if err != nil {
 		return nil, err
 	}
 
 	return &hotspotInstance{
-		d:                d,
-		rm:               rm,
-		bias:             bias,
-		addrToSymbol:     addrToSymbol,
-		addrToMethod:     addrToMethod,
-		addrToJITInfo:    addrToJITInfo,
-		addrToStubNameID: addrToStubNameID,
-		prefixes:         libpf.Set[lpm.Prefix]{},
-		stubs:            map[libpf.Address]StubRoutine{},
+		d:              d,
+		rm:             rm,
+		bias:           bias,
+		addrToSymbol:   addrToSymbol,
+		addrToMethod:   addrToMethod,
+		addrToJITInfo:  addrToJITInfo,
+		addrToStubName: addrToStubName,
+		prefixes:       libpf.Set[lpm.Prefix]{},
+		stubs:          xsync.NewRWMutex(map[libpf.Address]StubRoutine{}),
 	}, nil
+}
+
+func (d *hotspotData) Unload(_ interpreter.EbpfHandler) {
 }
 
 // locateJvmciVMStructs attempts to heuristically locate the JVMCI VM structs by
@@ -390,40 +396,34 @@ func (d *hotspotData) Attach(_ interpreter.EbpfHandler, _ libpf.PID, bias libpf.
 //
 //nolint:lll
 func locateJvmciVMStructs(ef *pfelf.File) (libpf.Address, error) {
-	const maxDataReadSize = 1 * 1024 * 1024   // seen in practice: 192 KiB
-	const maxRodataReadSize = 4 * 1024 * 1024 // seen in practice: 753 KiB
+	rdr := pfbufio.GetReader()
+	defer pfbufio.PutReader(rdr)
 
-	rodataSec := ef.Section(".rodata")
-	if rodataSec == nil {
+	rodata := ef.Section(".rodata")
+	if rodata == nil {
 		return 0, errors.New("unable to find `.rodata` section")
 	}
 
-	rodata, err := rodataSec.Data(maxRodataReadSize)
-	if err != nil {
-		return 0, err
-	}
+	rdr.Init(ef.Underlying(), int64(rodata.Offset), int64(rodata.FileSize))
 
-	offs := bytes.Index(rodata, []byte("Klass_vtable_start_offset"))
-	if offs == -1 {
+	offs, err := rdr.SearchSlice([]byte("Klass_vtable_start_offset"))
+	if err != nil {
 		return 0, errors.New("unable to find string for heuristic")
 	}
 
-	ptr := rodataSec.Addr + uint64(offs)
+	ptr := rodata.Addr + uint64(offs)
 	ptrEncoded := make([]byte, 8)
 	binary.LittleEndian.PutUint64(ptrEncoded, ptr)
 
-	dataSec := ef.Section(".data")
-	if dataSec == nil {
+	data := ef.Section(".data")
+	if data == nil {
 		return 0, errors.New("unable to find `.data` section")
 	}
 
-	data, err := dataSec.Data(maxDataReadSize)
-	if err != nil {
-		return 0, err
-	}
+	rdr.Init(ef.Underlying(), int64(data.Offset), int64(data.FileSize))
 
-	offs = bytes.Index(data, ptrEncoded)
-	if offs == -1 {
+	offs, err = rdr.SearchSlice(ptrEncoded)
+	if err != nil {
 		return 0, errors.New("unable to find string pointer")
 	}
 
@@ -431,7 +431,7 @@ func locateJvmciVMStructs(ef *pfelf.File) (libpf.Address, error) {
 	// gHotSpotVMStructEntryFieldNameOffset. This value unfortunately lives in
 	// BSS, so we have no choice but to hard-code it. Fortunately enough this
 	// offset hasn't changed since at least JDK 9.
-	return libpf.Address(dataSec.Addr + uint64(offs) - 8), nil
+	return libpf.Address(data.Addr + uint64(offs) - 8), nil
 }
 
 // forEachItem walks the given struct reflection fields recursively, and calls the visitor
@@ -465,7 +465,8 @@ func forEachItem(prefix string, t reflect.Value, visitor func(reflect.Value, str
 
 // newVMData will read introspection data from remote process and return hotspotVMData
 func (d *hotspotData) newVMData(rm remotememory.RemoteMemory, bias libpf.Address) (
-	hotspotVMData, error) {
+	hotspotVMData, error,
+) {
 	// Initialize the data with non-zero values so it's easy to check that
 	// everything got loaded (some fields will get zero values)
 	vmd := hotspotVMData{}
@@ -584,6 +585,20 @@ func (d *hotspotData) newVMData(rm remotememory.RemoteMemory, bias libpf.Address
 	} else if vms.Nmethod.DependenciesOffset != ^uint(0) {
 		vms.Nmethod.ImmutableData = 0
 		vms.Nmethod.ImmutableDataSize = 0
+	}
+
+	// JDK25+: metadata is inside mutable data
+	if vms.CodeBlob.MutableData != ^uint(0) {
+		vms.Nmethod.MetadataOffset = 0
+	} else if vms.Nmethod.MetadataOffset != ^uint(0) {
+		vms.CodeBlob.MutableData = 0
+		vms.CodeBlob.MutableDataSize = 0
+		vms.CodeBlob.RelocationSize = 0
+	}
+
+	// JDK26+: immutable data has a ref count trailer; not present prior to JDK26
+	if vms.Nmethod.ImmutableDataRefCountOff == ^uint(0) {
+		vms.Nmethod.ImmutableDataRefCountOff = 0
 	}
 
 	// Check that all symbols got loaded from JVM introspection data

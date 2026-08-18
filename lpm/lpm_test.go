@@ -1,5 +1,4 @@
 //go:build !integration
-// +build !integration
 
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
@@ -25,8 +24,6 @@ func TestGetRightmostSetBit(t *testing.T) {
 	}
 
 	for name, test := range tests {
-		name := name
-		test := test
 		t.Run(name, func(t *testing.T) {
 			output := getRightmostSetBit(test.input)
 			assert.Equal(t, test.expected, output)
@@ -57,8 +54,6 @@ func TestCalculatePrefixList(t *testing.T) {
 	}
 
 	for name, test := range tests {
-		name := name
-		test := test
 		t.Run(name, func(t *testing.T) {
 			prefixes, err := CalculatePrefixList(test.start, test.end)
 			if test.err {

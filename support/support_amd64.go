@@ -1,4 +1,4 @@
-//go:build amd64 && !dummy
+//go:build amd64
 
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
@@ -9,5 +9,5 @@ import (
 	_ "embed"
 )
 
-//go:embed ebpf/tracer.ebpf.release.amd64
+//go:embed ebpf/tracer.ebpf.amd64
 var tracerData []byte

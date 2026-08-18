@@ -31,6 +31,12 @@ const (
 	V8 InterpreterType = support.FrameMarkerV8
 	// Dotnet identifies the Dotnet interpreter.
 	Dotnet InterpreterType = support.FrameMarkerDotnet
+	// LuaJIT identifies the LuaJIT interpreter.
+	LuaJIT InterpreterType = support.FrameMarkerLuaJIT
+	// Go identifies Go code.
+	Go InterpreterType = support.FrameMarkerGo
+	// BEAM identifies the BEAM interpreter.
+	BEAM InterpreterType = support.FrameMarkerBEAM
 )
 
 // Pseudo-interpreters without a corresponding frame type.
@@ -40,12 +46,15 @@ const (
 
 	// APMInt identifies the pseudo-interpreter for the APM integration.
 	APMInt InterpreterType = 0x100
+
+	// Go identifies the pseudo-interpreter for Go custom labels support.
+	GoLabels InterpreterType = 0x101
 )
 
 // Frame converts the interpreter type into the corresponding frame type.
 func (i InterpreterType) Frame() FrameType {
 	if i >= pseudoInterpreterStart {
-		return unknownFrame
+		return UnknownFrame
 	}
 
 	return FrameType(i)
@@ -55,16 +64,20 @@ var interpreterTypeToString = map[InterpreterType]string{
 	UnknownInterp: "unknown",
 	PHP:           "php",
 	// OTel SemConv does not differentiate between jitted code and interpreted code.
-	PHPJIT:  "php",
-	Python:  "cpython",
-	Native:  "native",
-	Kernel:  "kernel",
-	HotSpot: "jvm",
-	Ruby:    "ruby",
-	Perl:    "perl",
-	V8:      "v8js",
-	Dotnet:  "dotnet",
-	APMInt:  "apm-integration",
+	PHPJIT:   "php",
+	Python:   "cpython",
+	Native:   "native",
+	Kernel:   "kernel",
+	HotSpot:  "jvm",
+	Ruby:     "ruby",
+	Perl:     "perl",
+	V8:       "v8js",
+	Dotnet:   "dotnet",
+	BEAM:     "beam",
+	APMInt:   "apm-integration",
+	LuaJIT:   "luajit",
+	Go:       "go",
+	GoLabels: "go-labels",
 }
 
 var stringToInterpreterType = make(map[string]InterpreterType, len(interpreterTypeToString))

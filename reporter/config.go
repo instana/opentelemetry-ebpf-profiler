@@ -8,7 +8,7 @@ import (
 
 	"google.golang.org/grpc"
 
-	"go.opentelemetry.io/ebpf-profiler/reporter/internal/samples"
+	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 )
 
 type Config struct {
@@ -26,22 +26,8 @@ type Config struct {
 
 	// Disable secure communication with Collection Agent.
 	DisableTLS bool
-	// ExecutablesCacheElements defines item capacity of the executables cache.
-	ExecutablesCacheElements uint32
-	// FramesCacheElements defines the item capacity of the frames cache.
-	FramesCacheElements uint32
-	// CGroupCacheElements defines the item capacity of the cgroup cache.
-	CGroupCacheElements uint32
 	// samplesPerSecond defines the number of samples per second.
 	SamplesPerSecond int
-	// HostID is the host ID to be sent to the collection agent.
-	HostID uint64
-	// KernelVersion is the kernel version of the host.
-	KernelVersion string
-	// HostName is the name of the host.
-	HostName string
-	// IPAddress is the IP address of the host.
-	IPAddress string
 
 	// Number of connection attempts to the collector after which we give up retrying.
 	MaxGRPCRetries uint32
@@ -50,6 +36,7 @@ type Config struct {
 	GRPCStartupBackoffTime time.Duration
 	GRPCConnectionTimeout  time.Duration
 	ReportInterval         time.Duration
+	ReportJitter           float64
 
 	// gRPCInterceptor is the client gRPC interceptor, e.g., for sending gRPC metadata.
 	GRPCClientInterceptor grpc.UnaryClientInterceptor
@@ -57,4 +44,8 @@ type Config struct {
 	// ExtraSampleAttrProd is an optional hook point for adding custom
 	// attributes to samples.
 	ExtraSampleAttrProd samples.SampleAttrProducer
+
+	// GRPCDialOptions allows passing additional gRPC dial options when establishing
+	// the connection to the collector. These options are appended after the default options.
+	GRPCDialOptions []grpc.DialOption
 }

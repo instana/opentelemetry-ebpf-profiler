@@ -47,11 +47,13 @@ _Static_assert(sizeof(uintptr_t) == 8, "bad uintptr_t size");
 _Static_assert(sizeof(size_t) == 8, "bad size_t size");
 
 // Define bool type (emulates stdbool.h).
+#if __STDC_VERSION__ < 202311L
 typedef _Bool bool;
-#ifndef __bool_true_false_are_defined
-  #define true                          1
-  #define false                         0
-  #define __bool_true_false_are_defined 1
+  #ifndef __bool_true_false_are_defined
+    #define true                          1
+    #define false                         0
+    #define __bool_true_false_are_defined 1
+  #endif
 #endif
 
 // Go defines `NULL` in `cgo-builtin-prolog`, so we have to check whether
@@ -71,7 +73,6 @@ struct task_struct;
 
 // Defined in arch/{x86,arm64}/include/asm/ptrace.h
 #if defined(__x86_64)
-  #define reg_pc ip
 struct pt_regs {
   unsigned long r15;
   unsigned long r14;
@@ -104,13 +105,7 @@ struct pt_regs {
   u64 orig_x0;
   s32 syscallno;
   u32 unused2;
-  u64 sdei_ttbr1;
-  u64 pmr_save;
-  u64 stackframe[2];
-  u64 lockdep_hardirqs;
-  u64 exit_rcu;
 };
-  #define reg_pc pc
 #else
   #error "Unsupported architecture"
 #endif
@@ -190,12 +185,11 @@ enum bpf_map_type {
   BPF_MAP_TYPE_CGRP_STORAGE,
 };
 
-// Flags bpf_get_stackid/bpf_get_stack.
+// Flags for bpf_get_stack.
 enum {
   BPF_F_SKIP_FIELD_MASK = 0xffULL,
   BPF_F_USER_STACK      = (1ULL << 8),
   BPF_F_FAST_STACK_CMP  = (1ULL << 9),
-  BPF_F_REUSE_STACKID   = (1ULL << 10),
   BPF_F_USER_BUILD_ID   = (1ULL << 11),
 };
 
@@ -203,6 +197,14 @@ enum {
 enum {
   BPF_F_NO_PREALLOC = (1U << 0),
   // (other values omitted here)
+};
+
+/* BPF_FUNC_bpf_ringbuf_commit, BPF_FUNC_bpf_ringbuf_discard, and
+ * BPF_FUNC_bpf_ringbuf_output flags.
+ */
+enum {
+  BPF_RB_NO_WAKEUP    = (1ULL << 0),
+  BPF_RB_FORCE_WAKEUP = (1ULL << 1),
 };
 
 // BPF helper function IDs

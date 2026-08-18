@@ -97,7 +97,7 @@ func checkForGoRoutineLeaks(t *testing.T) {
 }
 
 func TestCheckForGoRoutineLeaks(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	var wg sync.WaitGroup
@@ -134,13 +134,16 @@ func TestPeriodicCaller(t *testing.T) {
 			return StartWithJitter(ctx, interval, 0.2, cb)
 		},
 		"StartWithManualTrigger": func(ctx context.Context, cb func()) func() {
-			return StartWithManualTrigger(ctx, interval, trigger, func(bool) { cb() })
+			return StartWithManualTrigger(ctx, interval, trigger, func(bool) bool {
+				cb()
+				return true
+			})
 		},
 	}
 
 	for name, testFunc := range tests {
 		t.Run(name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			ctx, cancel := context.WithTimeout(t.Context(), 1*time.Second)
 
 			done := make(chan bool)
 			var counter atomic.Int32
@@ -187,13 +190,16 @@ func TestPeriodicCallerCancellation(t *testing.T) {
 			return StartWithJitter(ctx, interval, 0.2, cb)
 		},
 		"StartWithManualTrigger": func(ctx context.Context, cb func()) func() {
-			return StartWithManualTrigger(ctx, interval, trigger, func(bool) { cb() })
+			return StartWithManualTrigger(ctx, interval, trigger, func(bool) bool {
+				cb()
+				return true
+			})
 		},
 	}
 
 	for name, testFunc := range tests {
 		t.Run(name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
 
 			executions := make(chan struct{}, 20)
 			stop := testFunc(ctx, func() {
@@ -219,30 +225,62 @@ func TestPeriodicCallerCancellation(t *testing.T) {
 func TestPeriodicCallerManualTrigger(t *testing.T) {
 	defer checkForGoRoutineLeaks(t)
 	// Number of manual triggers
-	numTrigger := 5
+	numTrigger := int32(5)
 	// This should be something larger than time taken to execute triggers
 	interval := 10 * time.Second
-	ctx, cancel := context.WithTimeout(context.Background(), interval)
+	ctx, cancel := context.WithTimeout(t.Context(), interval)
 	defer cancel()
 
 	var counter atomic.Int32
 	trigger := make(chan bool)
 	done := make(chan bool)
 
-	stop := StartWithManualTrigger(ctx, interval, trigger, func(manualTrigger bool) {
+	stop := StartWithManualTrigger(ctx, interval, trigger, func(manualTrigger bool) bool {
 		require.True(t, manualTrigger)
 		n := counter.Add(1)
 		if n == int32(numTrigger) {
 			done <- true
 		}
+		return true
 	})
 	defer stop()
 
-	for i := 0; i < numTrigger; i++ {
+	for range numTrigger {
 		trigger <- true
 	}
 	<-done
+	assert.Equal(t, counter.Load(), numTrigger)
+}
 
-	numExec := counter.Load()
-	assert.Equal(t, int(numExec), numTrigger)
+// TestPeriodicCallerSelfStop tests periodic calling with self stoppage
+func TestPeriodicCallerSelfStop(t *testing.T) {
+	defer checkForGoRoutineLeaks(t)
+	// Number of iterations we allow the callback to be called
+	numIters := int32(5)
+
+	// This should be something larger than time taken to execute this test
+	timeout := time.After(10 * time.Second)
+
+	var counter atomic.Int32
+	trigger := make(chan bool)
+	done := make(chan bool, 1)
+
+	stop := StartWithManualTrigger(t.Context(), 1*time.Millisecond, trigger,
+		func(manualTrigger bool) bool {
+			n := counter.Add(1)
+			if n == int32(numIters) {
+				done <- true
+				return false
+			}
+			return true
+		})
+	defer stop()
+
+	select {
+	case <-timeout:
+		assert.Fail(t, "timeout - periodiccaller not working")
+	case <-done:
+	}
+
+	assert.Equal(t, numIters, counter.Load())
 }

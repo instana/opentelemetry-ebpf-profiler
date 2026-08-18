@@ -10,10 +10,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"strconv"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
-	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
@@ -59,7 +60,7 @@ func newTrackedCoredump(corePath, filePrefix string) (*trackedCoredump, error) {
 	}, nil
 }
 
-func (tc *trackedCoredump) GetMappingFileLastModified(_ *process.Mapping) int64 {
+func (tc *trackedCoredump) GetMappingFileLastModified(_ *process.RawMapping) int64 {
 	return 0
 }
 
@@ -70,38 +71,42 @@ func (tc *trackedCoredump) warnMissing(fileName string) {
 	}
 }
 
-func (tc *trackedCoredump) CalculateMappingFileID(m *process.Mapping) (libpf.FileID, error) {
+func (tc *trackedCoredump) CalculateMappingFileID(m *process.RawMapping) (libpf.FileID, error) {
 	if !m.IsVDSO() && !m.IsAnonymous() {
-		fid, err := libpf.FileIDFromExecutableFile(tc.prefix + m.Path)
+		file := m.Path
+		fid, err := libpf.FileIDFromExecutableFile(path.Join(tc.prefix, file))
 		if err == nil {
-			tc.seen[m.Path] = libpf.Void{}
+			tc.seen[file] = libpf.Void{}
 			return fid, nil
 		}
-		tc.warnMissing(m.Path)
+		tc.warnMissing(file)
 	}
 	return tc.CoredumpProcess.CalculateMappingFileID(m)
 }
 
-func (tc *trackedCoredump) OpenMappingFile(m *process.Mapping) (process.ReadAtCloser, error) {
+func (tc *trackedCoredump) OpenMappingFile(m *process.RawMapping) (process.ReadAtCloser, error) {
 	if !m.IsVDSO() && !m.IsAnonymous() {
-		rac, err := os.Open(tc.prefix + m.Path)
+		file := m.Path
+		rac, err := os.Open(path.Join(tc.prefix, file))
 		if err == nil {
-			tc.seen[m.Path] = libpf.Void{}
+			tc.seen[file] = libpf.Void{}
 			return rac, nil
 		}
-		tc.warnMissing(m.Path)
+		tc.warnMissing(file)
 	}
 	return tc.CoredumpProcess.OpenMappingFile(m)
 }
 
 func (tc *trackedCoredump) OpenELF(fileName string) (*pfelf.File, error) {
 	if fileName != process.VdsoPathName {
-		f, err := pfelf.Open(tc.prefix + fileName)
+		f, err := pfelf.Open(path.Join(tc.prefix, fileName))
 		if err == nil {
 			tc.seen[fileName] = libpf.Void{}
 			return f, err
 		}
-		tc.warnMissing(fileName)
+		if !errors.Is(err, pfelf.ErrNotELF) {
+			tc.warnMissing(fileName)
+		}
 	}
 	return tc.CoredumpProcess.OpenELF(fileName)
 }
@@ -164,7 +169,7 @@ func (cmd *newCmd) exec(context.Context, []string) (err error) {
 
 	testCase := &CoredumpTestCase{}
 
-	testCase.Threads, err = ExtractTraces(context.Background(), core, cmd.debugEbpf, nil)
+	testCase.Threads, err = ExtractTraces(context.Background(), core, cmd.debugEbpf, nil, nil)
 	if err != nil {
 		return fmt.Errorf("failed to extract traces: %w", err)
 	}
@@ -225,7 +230,6 @@ func dumpCore(pid uint64, noModuleBundling bool) (string, error) {
 	}
 
 	// `gcore` only accepts a path-prefix, not an exact path.
-	//nolint:gosec
 	err := exec.Command("gcore", "-o", gcorePathPrefix, strconv.FormatUint(pid, 10)).Run()
 	if err != nil {
 		return "", fmt.Errorf("gcore failed: %w", err)

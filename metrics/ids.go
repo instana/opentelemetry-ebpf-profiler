@@ -11,27 +11,6 @@ const (
 	// Leave out the 0 value. It's an indication of not explicitly initialized variables.
 	IDInvalid = 0
 
-	// CPU Usage: values are 0-100%
-	IDCPUUsage = 1
-
-	// I/O Throughput: values are bytes/s
-	IDIOThroughput = 2
-
-	// I/O Duration: values are 'weighted # of milliseconds doing I/O'
-	IDIODuration = 3
-
-	// Absolute number of goroutines when the metric was collected.
-	IDAgentGoRoutines = 4
-
-	// Absolute number in bytes of allocated heap objects of the agent.
-	IDAgentHeapAlloc = 5
-
-	// Difference to previous user CPU time of the agent in Milliseconds.
-	IDAgentUTime = 6
-
-	// Difference to previous system CPU time of the agent in Milliseconds.
-	IDAgentSTime = 7
-
 	// Number of calls to interpreter unwinding in dispatch_interpreters()
 	IDUnwindCallInterpreter = 8
 
@@ -100,9 +79,6 @@ const (
 
 	// Number of times unwind_stop is called without a trace
 	IDErrEmptyStack = 48
-
-	// Current size of the hash map pycodeobject_to_fileid
-	IDHashmapPyCodeObjectToFileID = 49
 
 	// Number of attempted Hotspot frame unwinds
 	IDUnwindHotspotAttempts = 50
@@ -218,15 +194,6 @@ const (
 	// Number of cache misses for PHP AddrToFunc
 	IDPHPAddrToFuncMiss = 97
 
-	// Current size in bytes of the local interval cache
-	IDLocalIntervalCacheSize = 98
-
-	// Number of cache hits of the local interval cache
-	IDLocalIntervalCacheHit = 99
-
-	// Number of cache misses of the local interval cache
-	IDLocalIntervalCacheMiss = 100
-
 	// Number of times a perf event was received without data (report_events)
 	IDPerfEventNoData = 101
 
@@ -244,12 +211,6 @@ const (
 
 	// Number of unwound Ruby frames
 	IDUnwindRubyFrames = 109
-
-	// Number of cache hits for Ruby IseqBodyPCToFunction
-	IDRubyIseqBodyPCHit = 110
-
-	// Number of cache misses for Ruby IseqBodyPCToFunction
-	IDRubyIseqBodyPCMiss = 111
 
 	// Number of cache hits for Ruby AddrToString
 	IDRubyAddrToStringHit = 112
@@ -301,12 +262,6 @@ const (
 
 	// Number of failures to unwind because return address was not found with heuristic
 	IDUnwindHotspotErrInvalidRA = 130
-
-	// Number of cache hits in tracehandler trace cache by BPF hash
-	IDKnownTracesHit = 131
-
-	// Number of cache misses in tracehandler trace cache by BPF hash
-	IDKnownTracesMiss = 132
 
 	// Current size of the unwind info array
 	IDUnwindInfoArraySize = 133
@@ -364,15 +319,6 @@ const (
 
 	// Number of cache misses for Hotspot AddrToStubNameID
 	IDHotspotAddrToStubNameIDMiss = 152
-
-	// Outgoing total RPC byte count (payload, uncompressed)
-	IDRPCBytesOutCount = 153
-
-	// Incoming total RPC byte count (payload, uncompressed)
-	IDRPCBytesInCount = 154
-
-	// Number of times reading /proc/<PID> failed due to missing text section
-	IDErrProcNoTextSec = 155
 
 	// Number of times reading /proc/<PID> as it does not exist anymore
 	IDErrProcNotExist = 156
@@ -437,12 +383,6 @@ const (
 	// Number of deleted cache elements for Python AddrToCodeObject
 	IDPythonAddrToCodeObjectDel = 178
 
-	// Number of added cache elements for Ruby IseqBodyPCToFunction
-	IDRubyIseqBodyPCAdd = 179
-
-	// Number of deleted cache elements for Ruby IseqBodyPCToFunction
-	IDRubyIseqBodyPCDel = 180
-
 	// Number of added cache elements for Ruby AddrToString
 	IDRubyAddrToStringAdd = 181
 
@@ -491,9 +431,6 @@ const (
 	// Number of times updating an element in exeIDToStackDeltas failed
 	IDExeIDToStackDeltasUpdate = 196
 
-	// Number of times deleting an element from exeIDToStackDeltas failed
-	IDExeIDToStackDeltasDelete = 197
-
 	// Number of times updating an element in stackDeltaPageToInfo failed
 	IDStackDeltaPageToInfoUpdate = 198
 
@@ -541,15 +478,6 @@ const (
 
 	// Total /proc/PID/maps parse time for a single collection interval, in microseconds
 	IDTotalProcParseUsec = 220
-
-	// Number of kubernetes client queries.
-	IDKubernetesClientQuery = 221
-
-	// Number of docker client queries.
-	IDDockerClientQuery = 222
-
-	// Number of containerd client queries.
-	IDContainerdClientQuery = 223
 
 	// Number of generic PID events (report_events)
 	IDNumGenericPID = 226
@@ -605,12 +533,6 @@ const (
 	// Number of failures to read the instruction sequence body
 	IDUnwindRubyErrReadIseqBody = 243
 
-	// Number of failures to read the instruction sequence encoded size
-	IDUnwindRubyErrReadIseqEncoded = 244
-
-	// Number of failures to read the instruction sequence size
-	IDUnwindRubyErrReadIseqSize = 245
-
 	// Number of times the unwind instructions requested LR unwinding mid-trace
 	IDUnwindNativeErrLrUnwindingMidTrace = 246
 
@@ -634,12 +556,6 @@ const (
 
 	// Number of times batch deleting elements from pidPageToMappingInfo failed
 	IDPidPageToMappingInfoBatchDelete = 253
-
-	// Outgoing total RPC byte count (on-the-wire, compressed)
-	IDWireBytesOutCount = 254
-
-	// Incoming total RPC byte count (on-the-wire, compressed)
-	IDWireBytesInCount = 255
 
 	// Number of times the Hotspot unwind instructions requested LR unwinding mid-trace
 	IDUnwindHotspotErrLrUnwindingMidTrace = 256
@@ -689,6 +605,66 @@ const (
 	// Number of times the stack delta provider succeeded to extract stack deltas
 	IDStackDeltaProviderSuccess = 271
 
+	// Number of times a trace event was received without data (trace_events)
+	IDTraceEventNoData = 273
+
+	// Number of times a trace event read failed (trace_events)
+	IDTraceEventReadError = 274
+
+	// Number of parsing errors seen during processing /proc/<PID>/maps
+	IDErrProcParse = 275
+
+	// Number of successfully symbolized Go frames
+	IDGoSymbolizationSuccess = 276
+
+	// Number of Go frames that failed symbolization
+	IDGoSymbolizationFailure = 277
+
+	// Number of attempts to read Go custom labels
+	IDUnwindGoLabelsAttempts = 278
+
+	// Number of failures reading Go custom labels
+	IDUnwindGoLabelsFailures = 279
+
+	// Number of invalid instruction sequences sequence
+	IDUnwindRubyErrInvalidIseq = 280
+
+	// Number of failures to read the Ruby method definition
+	IDUnwindRubyErrReadMethodDef = 281
+
+	// Number of failures to read the Ruby method type
+	IDUnwindRubyErrReadMethodType = 282
+
+	// Number of failures to read the Ruby svar while finding CME
+	IDUnwindRubyErrReadSvar = 283
+
+	// Number of failures to read the Ruby rbasic flags
+	IDUnwindRubyErrReadRbasicFlags = 284
+
+	// Number of failed attempts to read a CME by exceeding max EP checks
+	IDUnwindRubyErrCmeMaxEp = 285
+
+	// Number of failures to read TLS variables via the DTV
+	IDUnwindErrBadDTVRead = 286
+
+	// Number of cache hits for dotnet PE information
+	IDDotnetPEInfoCacheHit = 287
+
+	// Number of cache misses for dotnet PE information
+	IDDotnetPEInfoCacheMiss = 288
+
+	// Number of cache hits for dotnet #Strings heap lookups
+	IDDotnetStringsCacheHit = 289
+
+	// Number of cache misses for dotnet #Strings heap lookups
+	IDDotnetStringsCacheMiss = 290
+
+	// Number of bpf_ringbuf_output failures when sending trace events
+	IDBPFRingbufOutputErr = 291
+
+	// Number of cache hits for the dotnet PE open/parse error LRU
+	IDDotnetPEInfoErrCacheHit = 292
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 272
+	IDMax = 293
 )

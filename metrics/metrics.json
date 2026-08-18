@@ -7,6 +7,7 @@
     "id": 0
   },
   {
+    "obsolete": true,
     "description": "CPU Usage: values are 0-100%",
     "type": "gauge",
     "name": "CPUUsage",
@@ -15,6 +16,7 @@
     "id": 1
   },
   {
+    "obsolete": true,
     "description": "I/O Throughput: values are bytes/s",
     "type": "gauge",
     "name": "IOThroughput",
@@ -23,6 +25,7 @@
     "id": 2
   },
   {
+    "obsolete": true,
     "description": "I/O Duration: values are 'weighted # of milliseconds doing I/O'",
     "type": "gauge",
     "name": "IODuration",
@@ -31,6 +34,7 @@
     "id": 3
   },
   {
+    "obsolete": true,
     "description": "Absolute number of goroutines when the metric was collected.",
     "type": "gauge",
     "name": "AgentGoRoutines",
@@ -38,6 +42,7 @@
     "id": 4
   },
   {
+    "obsolete": true,
     "description": "Absolute number in bytes of allocated heap objects of the agent.",
     "type": "gauge",
     "name": "AgentHeapAlloc",
@@ -46,6 +51,7 @@
     "id": 5
   },
   {
+    "obsolete": true,
     "description": "Difference to previous user CPU time of the agent in Milliseconds.",
     "type": "counter",
     "name": "AgentUTime",
@@ -54,6 +60,7 @@
     "id": 6
   },
   {
+    "obsolete": true,
     "description": "Difference to previous system CPU time of the agent in Milliseconds.",
     "type": "counter",
     "name": "AgentSTime",
@@ -73,7 +80,8 @@
     "description": "Number of failures to call interpreter unwinding in dispatch_interpreters()",
     "type": "counter",
     "name": "UnwindErrCallInterpreter",
-    "id": 9
+    "id": 9,
+    "field": "unwind.err.call.interpreter"
   },
   {
     "description": "Unwind attempts since the previous check",
@@ -171,7 +179,8 @@
     "description": "Number of failures to read the autoTLSkey address",
     "type": "counter",
     "name": "UnwindPythonErrBadAutoTLSKeyAddr",
-    "id": 23
+    "id": 23,
+    "field": "unwind.python.err.bad.auto.tls.key.addr"
   },
   {
     "description": "Number of failures to read from the TLS",
@@ -185,7 +194,8 @@
     "description": "Number of failures to lookup the fsbase offset in tls_get_base()",
     "type": "counter",
     "name": "UnwindErrLookupFSBaseOffset",
-    "id": 25
+    "id": 25,
+    "field": "unwind.err.lookup.fs.base.offset"
   },
   {
     "description": "Number of failures to get the TLS base in tls_get_base()",
@@ -229,28 +239,32 @@
     "description": "Number of code objects with no filename in process_python_frame()",
     "type": "counter",
     "name": "UnwindPythonErrBadCodeObjectFilenameAddr",
-    "id": 31
+    "id": 31,
+    "field": "unwind.python.err.bad.code.object.filename.addr"
   },
   {
     "obsolete": true,
     "description": "Number of failures to zero out filename in process_python_frame()",
     "type": "counter",
     "name": "UnwindPythonErrBadZeroFileAddr",
-    "id": 32
+    "id": 32,
+    "field": "unwind.python.err.bad.zero.file.addr"
   },
   {
     "obsolete": true,
     "description": "Number of failures to get the file ID in process_python_frame()",
     "type": "counter",
     "name": "UnwindPythonErrBadFilenameAddr",
-    "id": 33
+    "id": 33,
+    "field": "unwind.python.err.bad.filename.addr"
   },
   {
     "obsolete": true,
     "description": "Number of failures to get the file ID in process_python_frame()",
     "type": "counter",
     "name": "UnwindPythonErrNoFileID",
-    "id": 34
+    "id": 34,
+    "field": "unwind.python.err.no.file.id"
   },
   {
     "obsolete": true,
@@ -296,21 +310,24 @@
     "description": "Current size of the hash map mmap_monitor",
     "type": "gauge",
     "name": "HashmapMmapMonitor",
-    "id": 40
+    "id": 40,
+    "field": "hashmap.mmap.monitor"
   },
   {
     "obsolete": true,
     "description": "Current size of the hash map mmap_executable",
     "type": "gauge",
     "name": "HashmapMmapExecutable",
-    "id": 41
+    "id": 41,
+    "field": "hashmap.mmap.executable"
   },
   {
     "obsolete": true,
     "description": "Current size of the hash map mprotect_executable",
     "type": "gauge",
     "name": "HashmapMprotectExecutable",
-    "id": 42
+    "id": 42,
+    "field": "hashmap.mprotect.executable"
   },
   {
     "description": "The number of executables loaded to eBPF maps",
@@ -357,6 +374,7 @@
     "id": 48
   },
   {
+    "obsolete": true,
     "description": "Current size of the hash map pycodeobject_to_fileid",
     "type": "gauge",
     "name": "HashmapPyCodeObjectToFileID",
@@ -529,7 +547,8 @@
     "description": "Number of times a PID maps file cannot be read as /proc/<PID> folder does not exist anymore",
     "type": "counter",
     "name": "ErrProcPIDRead",
-    "id": 72
+    "id": 72,
+    "field": "err.proc.pid.read"
   },
   {
     "obsolete": true,
@@ -709,6 +728,7 @@
     "id": 97
   },
   {
+    "obsolete": true,
     "description": "Current size in bytes of the local interval cache",
     "type": "gauge",
     "name": "LocalIntervalCacheSize",
@@ -717,6 +737,7 @@
     "id": 98
   },
   {
+    "obsolete": true,
     "description": "Number of cache hits of the local interval cache",
     "type": "counter",
     "name": "LocalIntervalCacheHit",
@@ -724,6 +745,7 @@
     "id": 99
   },
   {
+    "obsolete": true,
     "description": "Number of cache misses of the local interval cache",
     "type": "counter",
     "name": "LocalIntervalCacheMiss",
@@ -749,21 +771,24 @@
     "description": "Indicates if probabilistic sampling is en- or disabled. 1 sampling is enabled  - see ebpf.probSampleEnable. -1 sampling is disabled - see ebpf.probSampleDisable.",
     "type": "gauge",
     "name": "ProbSampleStatus",
-    "id": 103
+    "id": 103,
+    "field": "prob.sample.status"
   },
   {
     "obsolete": true,
     "description": "Number of times the cache for pre-to-post conversion trace hashes was hit.",
     "type": "counter",
     "name": "HashMapperCacheHit",
-    "id": 104
+    "id": 104,
+    "field": "hash.mapper.cache.hit"
   },
   {
     "obsolete": true,
     "description": "Number of times the cache for pre-to-post conversion trace hashes was missed.",
     "type": "counter",
     "name": "HashMapperCacheMiss",
-    "id": 105
+    "id": 105,
+    "field": "hash.mapper.cache.miss"
   },
   {
     "description": "Number of successfully symbolized Ruby frames",
@@ -794,6 +819,7 @@
     "id": 109
   },
   {
+    "obsolete": true,
     "description": "Number of cache hits for Ruby IseqBodyPCToFunction",
     "type": "counter",
     "name": "RubyIseqBodyPCHit",
@@ -801,6 +827,7 @@
     "id": 110
   },
   {
+    "obsolete": true,
     "description": "Number of cache misses for Ruby IseqBodyPCToFunction",
     "type": "counter",
     "name": "RubyIseqBodyPCMiss",
@@ -826,7 +853,8 @@
     "description": "Number of times a pre-conversion hash has not been present in the traceHashMapper used by the traceHandler",
     "type": "counter",
     "name": "TraceHashMapperMissingEntry",
-    "id": 114
+    "id": 114,
+    "field": "trace.hash.mapper.missing.entry"
   },
   {
     "description": "Number of attempted perl unwinds",
@@ -931,7 +959,8 @@
     "description": "Number of failures to unwind because PC is outside matched codeblob code range",
     "type": "counter",
     "name": "UnwindHotspotErrPCOutsideCodeblobCode",
-    "id": 129
+    "id": 129,
+    "field": "unwind.hotspot.err.pc.outside.codeblob.code"
   },
   {
     "description": "Number of failures to unwind because return address was not found with heuristic",
@@ -941,6 +970,7 @@
     "id": 130
   },
   {
+    "obsolete": true,
     "description": "Number of cache hits in tracehandler trace cache by BPF hash",
     "type": "counter",
     "name": "KnownTracesHit",
@@ -948,6 +978,7 @@
     "id": 131
   },
   {
+    "obsolete": true,
     "description": "Number of cache misses in tracehandler trace cache by BPF hash",
     "type": "counter",
     "name": "KnownTracesMiss",
@@ -973,7 +1004,8 @@
     "description": "Number of elements zapped from known traces",
     "type": "counter",
     "name": "KnownTracesZapCount",
-    "id": 135
+    "id": 135,
+    "field": "known.traces.zap.count"
   },
   {
     "description": "Number of attempted V8 unwinds",
@@ -1095,6 +1127,7 @@
     "id": 152
   },
   {
+    "obsolete": true,
     "description": "Outgoing total RPC byte count (payload, uncompressed)",
     "type": "counter",
     "name": "RPCBytesOutCount",
@@ -1103,6 +1136,7 @@
     "id": 153
   },
   {
+    "obsolete": true,
     "description": "Incoming total RPC byte count (payload, uncompressed)",
     "type": "counter",
     "name": "RPCBytesInCount",
@@ -1111,6 +1145,7 @@
     "id": 154
   },
   {
+    "obsolete": true,
     "description": "Number of times reading /proc/<PID> failed due to missing text section",
     "type": "counter",
     "name": "ErrProcNoTextSec",
@@ -1281,6 +1316,7 @@
     "id": 178
   },
   {
+    "obsolete": true,
     "description": "Number of added cache elements for Ruby IseqBodyPCToFunction",
     "type": "counter",
     "name": "RubyIseqBodyPCAdd",
@@ -1288,6 +1324,7 @@
     "id": 179
   },
   {
+    "obsolete": true,
     "description": "Number of deleted cache elements for Ruby IseqBodyPCToFunction",
     "type": "counter",
     "name": "RubyIseqBodyPCDel",
@@ -1407,6 +1444,7 @@
     "id": 196
   },
   {
+    "obsolete": true,
     "description": "Number of times deleting an element from exeIDToStackDeltas failed",
     "type": "counter",
     "name": "ExeIDToStackDeltasDelete",
@@ -1504,21 +1542,24 @@
     "description": "Number of lost perf events in the communication between kernel and user space (report_munmap_events)",
     "type": "counter",
     "name": "PerfEventLostMunmap",
-    "id": 210
+    "id": 210,
+    "field": "perf_event.lost.munmap"
   },
   {
     "obsolete": true,
     "description": "Number of times a perf event was received without data (report_munmap_events)",
     "type": "counter",
     "name": "PerfEventNoDataMunmap",
-    "id": 211
+    "id": 211,
+    "field": "perf_event.no.data.munmap"
   },
   {
     "obsolete": true,
     "description": "Number of times a perf event read failed (report_munmap_events)",
     "type": "counter",
     "name": "PerfEventReadErrorMunmap",
-    "id": 212
+    "id": 212,
+    "field": "perf_event.read.error.munmap"
   },
   {
     "description": "Number of new PID events (report_events)",
@@ -1554,7 +1595,8 @@
     "description": "Number of munmap events (report_munmap_events)",
     "type": "counter",
     "name": "NumMunmapEvent",
-    "id": 217
+    "id": 217,
+    "field": "num.munmap.event"
   },
   {
     "description": "Max /proc/PID/maps parse time for a single collection interval, in microseconds",
@@ -1581,6 +1623,7 @@
     "id": 220
   },
   {
+    "obsolete": true,
     "description": "Number of kubernetes client queries.",
     "type": "counter",
     "name": "KubernetesClientQuery",
@@ -1588,6 +1631,7 @@
     "id": 221
   },
   {
+    "obsolete": true,
     "description": "Number of docker client queries.",
     "type": "counter",
     "name": "DockerClientQuery",
@@ -1595,6 +1639,7 @@
     "id": 222
   },
   {
+    "obsolete": true,
     "description": "Number of containerd client queries.",
     "type": "counter",
     "name": "ContainerdClientQuery",
@@ -1607,7 +1652,8 @@
     "type": "counter",
     "name": "MonitorHashMapsIntervalMs",
     "unit": "ms",
-    "id": 224
+    "id": 224,
+    "field": "monitor.hash.maps.interval.ms"
   },
   {
     "obsolete": true,
@@ -1649,26 +1695,30 @@
     "description": "Indicates if probabilistic profiling is enabled or disabled: 1 profiling is enabled, -1 profiling is disabled.",
     "type": "gauge",
     "name": "ProbProfilingStatus",
-    "id": 230
+    "id": 230,
+    "field": "prob.profiling.status"
   },
   {
     "description": "Interval in seconds for which probabilistic profiling will be enabled or disabled.",
     "type": "counter",
     "name": "ProbProfilingInterval",
     "id": 231,
-    "unit": "s"
+    "unit": "s",
+    "field": "prob.profiling.interval"
   },
   {
     "description": "Number of times enabling a perf event hook failed",
     "type": "counter",
     "name": "PerfEventEnableErr",
-    "id": 232
+    "id": 232,
+    "field": "perf_event.enable.err"
   },
   {
     "description": "Number of times disabling a perf event hook failed",
     "type": "counter",
     "name": "PerfEventDisableErr",
-    "id": 233
+    "id": 233,
+    "field": "perf_event.disable.err"
   },
   {
     "description": "Number of times we didn't find an entry for this process in the Python process info array",
@@ -1742,6 +1792,7 @@
   },
   {
     "description": "Number of failures to read the instruction sequence encoded size",
+    "obsolete": true,
     "type": "counter",
     "name": "UnwindRubyErrReadIseqEncoded",
     "field": "bpf.ruby.errors.read_iseq_encoded",
@@ -1749,6 +1800,7 @@
   },
   {
     "description": "Number of failures to read the instruction sequence size",
+    "obsolete": true,
     "type": "counter",
     "name": "UnwindRubyErrReadIseqSize",
     "field": "bpf.ruby.errors.read_iseq_size",
@@ -1811,6 +1863,7 @@
     "id": 253
   },
   {
+    "obsolete": true,
     "description": "Outgoing total RPC byte count (on-the-wire, compressed)",
     "type": "counter",
     "name": "WireBytesOutCount",
@@ -1819,6 +1872,7 @@
     "id": 254
   },
   {
+    "obsolete": true,
     "description": "Incoming total RPC byte count (on-the-wire, compressed)",
     "type": "counter",
     "name": "WireBytesInCount",
@@ -1937,5 +1991,153 @@
     "name": "StackDeltaProviderSuccess",
     "field": "agent.stack_delta_extraction.success",
     "id": 271
+  },
+  {
+    "obsolete": true,
+    "description": "Number of lost trace events in the communication between kernel and user space (trace_events)",
+    "type": "counter",
+    "name": "TraceEventLost",
+    "field": "agent.errors.trace_event_lost",
+    "id": 272
+  },
+  {
+    "description": "Number of times a trace event was received without data (trace_events)",
+    "type": "counter",
+    "name": "TraceEventNoData",
+    "field": "agent.errors.trace_event_no_data",
+    "id": 273
+  },
+  {
+    "description": "Number of times a trace event read failed (trace_events)",
+    "type": "counter",
+    "name": "TraceEventReadError",
+    "field": "agent.errors.trace_event_read_error",
+    "id": 274
+  },
+  {
+    "description": "Number of parsing errors seen during processing /proc/<PID>/maps",
+    "type": "counter",
+    "name": "ErrProcParse",
+    "field": "agent.errors.proc_parse",
+    "id": 275
+  },
+  {
+    "description": "Number of successfully symbolized Go frames",
+    "type": "counter",
+    "name": "GoSymbolizationSuccess",
+    "field": "agent.go.symbolization.successes",
+    "id": 276
+  },
+  {
+    "description": "Number of Go frames that failed symbolization",
+    "type": "counter",
+    "name": "GoSymbolizationFailure",
+    "field": "agent.go.symbolization.failures",
+    "id": 277
+  },
+  {
+    "description": "Number of attempts to read Go custom labels",
+    "type": "counter",
+    "name": "UnwindGoLabelsAttempts",
+    "field": "bpf.golabels.attempts",
+    "id": 278
+  },
+  {
+    "description": "Number of failures reading Go custom labels",
+    "type": "counter",
+    "name": "UnwindGoLabelsFailures",
+    "field": "bpf.golabels.errors",
+    "id": 279
+  },
+  {
+    "description": "Number of invalid instruction sequences sequence",
+    "type": "counter",
+    "name": "UnwindRubyErrInvalidIseq",
+    "field": "bpf.ruby.errors.invalid_iseq",
+    "id": 280
+  },
+  {
+    "description": "Number of failures to read the Ruby method definition",
+    "type": "counter",
+    "name": "UnwindRubyErrReadMethodDef",
+    "field": "bpf.ruby.errors.read_method_def",
+    "id": 281
+  },
+  {
+    "description": "Number of failures to read the Ruby method type",
+    "type": "counter",
+    "name": "UnwindRubyErrReadMethodType",
+    "field": "bpf.ruby.errors.read_method_type",
+    "id": 282
+  },
+  {
+    "description": "Number of failures to read the Ruby svar while finding CME",
+    "type": "counter",
+    "name": "UnwindRubyErrReadSvar",
+    "field": "bpf.ruby.errors.read_svar",
+    "id": 283
+  },
+  {
+    "description": "Number of failures to read the Ruby rbasic flags",
+    "type": "counter",
+    "name": "UnwindRubyErrReadRbasicFlags",
+    "field": "bpf.ruby.errors.read_rbasic_flags",
+    "id": 284
+  },
+  {
+    "description": "Number of failed attempts to read a CME by exceeding max EP checks",
+    "type": "counter",
+    "name": "UnwindRubyErrCmeMaxEp",
+    "field": "bpf.ruby.errors.read_cme_max_ep",
+    "id": 285
+  },
+  {
+    "description": "Number of failures to read TLS variables via the DTV",
+    "type": "counter",
+    "name": "UnwindErrBadDTVRead",
+    "field": "bpf.errors.bad_dtv_read",
+    "id": 286
+  },
+  {
+    "description": "Number of cache hits for dotnet PE information",
+    "type": "counter",
+    "name": "DotnetPEInfoCacheHit",
+    "field": "agent.dotnet.pe_info_cache.hits",
+    "id": 287
+  },
+  {
+    "description": "Number of cache misses for dotnet PE information",
+    "type": "counter",
+    "name": "DotnetPEInfoCacheMiss",
+    "field": "agent.dotnet.pe_info_cache.misses",
+    "id": 288
+  },
+  {
+    "description": "Number of cache hits for dotnet #Strings heap lookups",
+    "type": "counter",
+    "name": "DotnetStringsCacheHit",
+    "field": "agent.dotnet.strings_cache.hits",
+    "id": 289
+  },
+  {
+    "description": "Number of cache misses for dotnet #Strings heap lookups",
+    "type": "counter",
+    "name": "DotnetStringsCacheMiss",
+    "field": "agent.dotnet.strings_cache.misses",
+    "id": 290
+  },
+  {
+    "description": "Number of bpf_ringbuf_output failures when sending trace events",
+    "type": "counter",
+    "name": "BPFRingbufOutputErr",
+    "field": "bpf.errors.ringbuf_output",
+    "id": 291
+  },
+  {
+    "description": "Number of cache hits for the dotnet PE open/parse error LRU",
+    "type": "counter",
+    "name": "DotnetPEInfoErrCacheHit",
+    "field": "agent.dotnet.pe_info_err_cache.hits",
+    "id": 292
   }
 ]

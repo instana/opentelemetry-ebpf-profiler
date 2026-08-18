@@ -8,7 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
 
 	npsr "go.opentelemetry.io/ebpf-profiler/nopanicslicereader"
 )
@@ -40,7 +40,7 @@ const (
 
 	// CLR internal debug info flags
 	// https://github.com/dotnet/runtime/blob/v7.0.15/src/coreclr/vm/debuginfostore.cpp#L458
-	extraDebugInfoPathcPoint = 0x01
+	extraDebugInfoPatchPoint = 0x01
 	extraDebugInfoRich       = 0x02
 )
 
@@ -66,7 +66,7 @@ func (m *dotnetMethod) mapPCOffsetToILOffset(pcOffset uint32, findCall bool) uin
 	nativeOffset := uint32(0)
 	ilOffset := uint32(0)
 	lastCallILOffset := uint32(0)
-	for i := uint32(0); i < numEntries; i++ {
+	for i := range numEntries {
 		nativeOffset += nr.Uint32()
 		if findCall && nativeOffset >= pcOffset {
 			// If finding call site, always return lastCallILOffset.
@@ -109,7 +109,7 @@ func (m *dotnetMethod) dumpBounds() {
 	// Decode Bounds Info portion of DebugInfo
 	// https://github.com/dotnet/runtime/blob/main/src/coreclr/vm/debuginfostore.cpp#L289-L310
 	nativeOffset := uint32(0)
-	for i := uint32(0); i < numEntries; i++ {
+	for i := range numEntries {
 		nativeOffset += nr.Uint32()
 		ilOffset := uint32(int32(nr.Uint32()) + mappingTypeMaxValue)
 		sourceFlags := nr.Uint32()
@@ -130,7 +130,7 @@ func dumpRichDebugInfo(richInfo []byte) {
 	// Decode Rich Debug info's Inline Tree Nodes
 	// https://github.com/dotnet/runtime/blob/main/src/coreclr/vm/debuginfostore.cpp#L404-L429
 	var ilOffset, child, sibling int32
-	for i := uint32(0); i < numInlineTree; i++ {
+	for range numInlineTree {
 		ptr := nr.Ptr()
 		ilOffset += nr.Int32()
 		child += nr.Int32()
@@ -144,7 +144,7 @@ func dumpRichDebugInfo(richInfo []byte) {
 	nativeOffset := uint32(0)
 	ilOffset = 0
 	inlinee := int32(0)
-	for i := uint32(0); i < numRichOffsets; i++ {
+	for range numRichOffsets {
 		nativeOffset += nr.Uint32()
 		inlinee += nr.Int32()
 		ilOffset += nr.Int32()
@@ -156,7 +156,7 @@ func dumpRichDebugInfo(richInfo []byte) {
 
 // Read and parse the dotnet coreclr DebugInfo structure
 // https://github.com/dotnet/runtime/blob/main/src/coreclr/vm/debuginfostore.cpp#L711
-func (m *dotnetMethod) readDebugInfo(r *cachingReader, d *dotnetData) error {
+func (m *dotnetMethod) readDebugInfo(r *cachingReader, cdac *dotnetCdac) error {
 	// The Flags byte is optional depending on build options. Namely FEATURE_ON_STACK_REPLACEMENT
 	// enables it always, which is always enabled for x86 and arm64.
 	// https://github.com/dotnet/runtime/blob/main/src/coreclr/vm/codeman.cpp#L3786-L3804
@@ -164,14 +164,14 @@ func (m *dotnetMethod) readDebugInfo(r *cachingReader, d *dotnetData) error {
 	if err != nil {
 		return fmt.Errorf("failed to read flags: %w", err)
 	}
-	if flags&^(extraDebugInfoPathcPoint|extraDebugInfoRich) != 0 {
+	if flags&^(extraDebugInfoPatchPoint|extraDebugInfoRich) != 0 {
 		return fmt.Errorf("flags (%#x) not supported", flags)
 	}
-	if flags&extraDebugInfoPathcPoint != 0 {
+	if flags&extraDebugInfoPatchPoint != 0 {
 		// skip PatchpointInfo
 		// https://github.com/dotnet/runtime/blob/main/src/coreclr/vm/debuginfostore.cpp#L741-L746
 		// https://github.com/dotnet/runtime/blob/v7.0.15/src/coreclr/inc/patchpointinfo.h#L29-L35
-		vms := &d.vmStructs
+		vms := &cdac.Types
 		patchpointInfo := make([]byte, vms.PatchpointInfo.SizeOf)
 		if _, err = r.Read(patchpointInfo); err != nil {
 			return fmt.Errorf("failed to read patchpoint info: %w", err)

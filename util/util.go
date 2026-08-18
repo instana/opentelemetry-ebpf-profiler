@@ -5,35 +5,12 @@ package util // import "go.opentelemetry.io/ebpf-profiler/util"
 
 import (
 	"math/bits"
-	"strconv"
 	"sync/atomic"
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/sirupsen/logrus"
-
 	"go.opentelemetry.io/ebpf-profiler/libpf/hash"
 )
-
-// HexToUint64 is a convenience function to extract a hex string to a uint64 and
-// not worry about errors. Essentially a "mustConvertHexToUint64".
-func HexToUint64(str string) uint64 {
-	v, err := strconv.ParseUint(str, 16, 64)
-	if err != nil {
-		logrus.Fatalf("Failure to hex-convert %s to uint64: %v", str, err)
-	}
-	return v
-}
-
-// DecToUint64 is a convenience function to extract a decimal string to a uint64
-// and not worry about errors. Essentially a "mustConvertDecToUint64".
-func DecToUint64(str string) uint64 {
-	v, err := strconv.ParseUint(str, 10, 64)
-	if err != nil {
-		logrus.Fatalf("Failure to dec-convert %s to uint64: %v", str, err)
-	}
-	return v
-}
 
 // IsValidString checks if string is UTF-8-encoded and only contains expected characters.
 func IsValidString(s string) bool {
@@ -49,15 +26,6 @@ func IsValidString(s string) bool {
 		}
 	}
 	return true
-}
-
-// NextPowerOfTwo returns input value if it's a power of two,
-// otherwise it returns the next power of two.
-func NextPowerOfTwo(v uint32) uint32 {
-	if v == 0 {
-		return 1
-	}
-	return 1 << bits.Len32(v-1)
 }
 
 // AtomicUpdateMaxUint32 updates the value in store using atomic memory primitives. newValue will
@@ -80,11 +48,6 @@ func AtomicUpdateMaxUint32(store *atomic.Uint32, newValue uint32) {
 	}
 }
 
-// VersionUint returns a single integer composed of major, minor, patch.
-func VersionUint(major, minor, patch uint32) uint32 {
-	return (major << 16) + (minor << 8) + patch
-}
-
 // Range describes a range with Start and End values.
 type Range struct {
 	Start uint64
@@ -101,4 +64,22 @@ type OnDiskFileIdentifier struct {
 
 func (odfi OnDiskFileIdentifier) Hash32() uint32 {
 	return uint32(hash.Uint64(odfi.InodeNum) + odfi.DeviceID)
+}
+
+// NextPowerOfTwo returns value rounded up to the next power of two.
+// It returns value unchanged if value is already a power of two.
+// The value returned is capped to the largest power-of-two that can
+// be represented by uint64.
+func NextPowerOfTwo(v uint64) uint64 {
+	const maxVal = uint64(1 << 63)
+
+	if v <= 1 {
+		return 1
+	}
+
+	if v > maxVal {
+		return maxVal
+	}
+
+	return 1 << bits.Len64(v-1)
 }

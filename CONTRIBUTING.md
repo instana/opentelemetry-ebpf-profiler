@@ -18,6 +18,13 @@ get invited to meetings.
 See the [#otel-profiles](https://cloud-native.slack.com/archives/C03J794L0BV)
 slack channel for discussions and questions.
 
+## Pre-requisites
+
+- Linux (5.10+) with eBPF enabled (the profiler currently only runs on Linux)
+- Go as specified in [go.mod](https://github.com/open-telemetry/opentelemetry-ebpf-profiler/blob/main/go.mod)
+- docker
+- Rust as specified in [Cargo.toml](https://github.com/open-telemetry/opentelemetry-ebpf-profiler/blob/main/Cargo.toml)
+
 ## Development
 
 You can view and edit the source code by cloning this repository:
@@ -79,6 +86,25 @@ All pull requests are squashed to a single commit upon merge to `main`.
 	[`draft`](https://github.blog/2019-02-14-introducing-draft-pull-requests/).
 * Make sure CLA is signed and CI is clear.
 
+### How to Address Review Feedback
+
+Please use the GitHub UI to accept review suggestions that you don't
+subsequently modify. Do not reimplement them in a separate commit.
+The latter behavior is problematic as it:
+
+1. Increases burden on reviewers who have to spend additional time to check
+   that your reimplementation accurately reflects the original suggestion.
+2. Increases the probability of bugs being introduced into the codebase.
+   This is not a theoretical concern as we've seen it happen multiple times.
+3. Does not credit the reviewer who came up with the accepted suggestion.
+
+You can pull the GitHub-generated commits (after you've accepted a suggestion)
+into your local repository by executing:
+
+```sh
+git pull <YOUR_FORK> <YOUR_BRANCH_NAME>
+```
+
 ### How to Get PRs Merged
 
 A PR is considered **ready to merge** when:
@@ -125,13 +151,55 @@ Any [Maintainer] can merge the PR once the above criteria have been met.
 [^1]: A qualified approval is a GitHub Pull Request review with "Approve"
 	status from an OpenTelemetry Profiler [Approver] or [Maintainer].
 
-## Approvers and Maintainers
+## Membership, Roles, and Responsibilities
 
-### Approvers
+See the [OpenTelemetry membership
+guide](https://github.com/open-telemetry/community/blob/main/guides/contributor/membership.md)
+for information on how to become a member of the OpenTelemetry organization and
+the different roles available. In addition to the roles listed there we also
+have a Profiler-specific role: code owners.
 
-- [Florian Lehner](https://github.com/florianl), Elastic
-- [Joel Höner](https://github.com/athre0z)
-- [Tim Rühsen](https://github.com/rockdaboot), Elastic
+### Becoming a Code Owner
+
+A Code Owner is responsible for a component (typically a language interpreter) within the
+OpenTelemetry eBPF Profiler, as indicated by the [CODEOWNERS
+file](https://github.com/open-telemetry/opentelemetry-ebpf-profiler/blob/main/.github/CODEOWNERS).
+That responsibility includes maintaining the component, triaging and
+responding to issues, and reviewing pull requests.
+
+Sometimes the component may be in need of a new or additional Code Owner.
+A few reasons this situation may arise would be:
+
+- The existing Code Owners are actively looking for more help.
+- A previous Code Owner stepped down.
+- An existing Code Owner has become unresponsive.
+- The component was never assigned a Code Owner.
+
+Code Ownership does not have to be a full-time job. If you can find a couple
+hours to help out on a recurring basis, please consider pursuing Code Ownership.
+
+#### Requirements
+
+If you would like to help and become a Code Owner you must meet the following
+requirements:
+
+1. [Be a member of the OpenTelemetry
+organization.](https://github.com/open-telemetry/community/blob/main/guides/contributor/membership.md#member)
+2. (Code Owner Discretion) It is best to have resolved an issue related to the
+component, contributed directly to the component, and/or review component PRs.
+How much interaction with the component is required before becoming a Code Owner
+is up to any existing Code Owners.
+
+Code Ownership is ultimately up to the judgment of the existing Code Owners and
+eBPF Profiler Maintainers. Meeting the above requirements is not a guarantee to
+be granted Code Ownership.
+
+#### How to become a Code Owner
+
+To become a Code Owner, add your GitHub username to the
+[CODEOWNERS](.github/CODEOWNERS)] file with an entry for all files related to
+the component code. Be sure to tag the existing Code Owners, if any, within
+the PR to ensure they receive a notification.
 
 ### Maintainers
 
@@ -139,6 +207,18 @@ Any [Maintainer] can merge the PR once the above criteria have been met.
 - [Dmitry Filimonov](https://github.com/petethepig), Pyroscope/Grafana
 - [Felix Geisendörfer](https://github.com/felixge), Datadog
 - [Timo Teräs](https://github.com/fabled)
+
+For more information about the maintainer role, see the [community repository](https://github.com/open-telemetry/community/blob/main/guides/contributor/membership.md#maintainer).
+
+### Approvers
+
+- [Damien Mathieu](https://github.com/dmathieu), Elastic
+- [Florian Lehner](https://github.com/florianl), Elastic
+- [Joel Höner](https://github.com/athre0z)
+- [Roger Coll](https://github.com/rogercoll), Elastic
+- [Tim Rühsen](https://github.com/rockdaboot)
+
+For more information about the approver role, see the [community repository](https://github.com/open-telemetry/community/blob/main/guides/contributor/membership.md#approver).
 
 ### Become an Approver or a Maintainer
 

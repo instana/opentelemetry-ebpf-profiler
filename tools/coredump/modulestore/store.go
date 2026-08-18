@@ -7,7 +7,10 @@
 package modulestore // import "go.opentelemetry.io/ebpf-profiler/tools/coredump/modulestore"
 
 import (
+	"archive/tar"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -21,7 +24,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
-	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"golang.org/x/sys/unix"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
@@ -136,7 +139,7 @@ func (store *Store) OpenReadAt(id ID) (*ModuleReader, error) {
 
 	file, err := zstpak.Open(localPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open local file: %w", err)
+		return nil, fmt.Errorf("failed to open local file %s: %w", localPath, err)
 	}
 
 	reader := &ModuleReader{
@@ -151,7 +154,8 @@ func (store *Store) OpenReadAt(id ID) (*ModuleReader, error) {
 
 // OpenBufferedReadAt is a buffered version of `OpenReadAt`.
 func (store *Store) OpenBufferedReadAt(id ID, cacheSizeBytes uint) (
-	*ModuleReader, error) {
+	*ModuleReader, error,
+) {
 	reader, err := store.OpenReadAt(id)
 	if err != nil {
 		return nil, err
@@ -197,9 +201,19 @@ func (store *Store) UploadModule(id ID) error {
 		return fmt.Errorf("failed to open local file: %w", err)
 	}
 
+	hasher := sha256.New()
+	if _, err = io.Copy(hasher, file); err != nil {
+		return fmt.Errorf("failed to hash content of %q: %v", localPath, err)
+	}
+	contentSHA256 := base64.StdEncoding.EncodeToString(hasher.Sum(nil))
+
 	moduleKey := makeS3Key(id)
 	contentType := "application/octet-stream"
 	contentDisposition := "attachment"
+
+	if _, err = file.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to set position in file %q: %v", localPath, err)
+	}
 
 	_, err = store.s3client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket:             &store.bucket,
@@ -207,6 +221,7 @@ func (store *Store) UploadModule(id ID) error {
 		Body:               file,
 		ContentType:        &contentType,
 		ContentDisposition: &contentDisposition,
+		ChecksumSHA256:     &contentSHA256,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to upload file: %w", err)
@@ -319,6 +334,36 @@ func (store *Store) UnpackModule(id ID, out io.Writer) error {
 	return nil
 }
 
+// ExportModule exports a compressed module from the store, writing it to the given writer.
+func (store *Store) ExportModule(id ID, tw *tar.Writer) error {
+	localPath, err := store.ensurePresentLocally(id)
+	if err != nil {
+		return err
+	}
+	file, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	fi, err := file.Stat()
+	if err != nil {
+		return err
+	}
+
+	hdr := &tar.Header{
+		Name:    localPath,
+		Mode:    0o644,
+		Size:    int64(fi.Size()),
+		ModTime: fi.ModTime(),
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		return err
+	}
+	_, err = io.Copy(tw, file)
+	return err
+}
+
 // IsPresentRemotely checks whether a module is present in the remote data-store.
 func (store *Store) IsPresentRemotely(id ID) (bool, error) {
 	moduleKey := makeS3Key(id)
@@ -326,7 +371,6 @@ func (store *Store) IsPresentRemotely(id ID) (bool, error) {
 		Bucket: &store.bucket,
 		Key:    &moduleKey,
 	})
-
 	if err != nil {
 		if isErrNoSuchKey(err) {
 			return false, nil
@@ -426,19 +470,23 @@ func (store *Store) ensurePresentLocally(id ID) (string, error) {
 		return localPath, nil
 	}
 
-	// Download the file to a temporary location to prevent half-complete modules on crashes.
-	file, err := os.CreateTemp(store.localCachePath, localTempPrefix)
-	if err != nil {
-		return "", fmt.Errorf("failed to create local file: %w", err)
-	}
-	defer file.Close()
-
 	moduleKey := makeS3Key(id)
 	resp, err := http.Get(store.publicReadURL + moduleKey)
 	if err != nil {
 		return "", fmt.Errorf("failed to request file: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		errorResponse, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("store returned %d %s", resp.StatusCode, errorResponse)
+	}
+
+	// Download the file to a temporary location to prevent half-complete modules on crashes.
+	file, err := os.CreateTemp(store.localCachePath, localTempPrefix)
+	if err != nil {
+		return "", fmt.Errorf("failed to create local file: %w", err)
+	}
+	defer file.Close()
 	if _, err = io.Copy(file, resp.Body); err != nil {
 		return "", fmt.Errorf("failed to receive file: %w", err)
 	}
@@ -459,7 +507,8 @@ func (store *Store) makeLocalPath(id ID) string {
 // file recognized as a valid module ID, `unkVisitor` is called with the full path of all other
 // files in the path.
 func (store *Store) visitLocalModules(moduleVisitor func(ID) error,
-	unkVisitor func(string) error) error {
+	unkVisitor func(string) error,
+) error {
 	files, err := os.ReadDir(store.localCachePath)
 	if err != nil {
 		return fmt.Errorf("failed to read files in local cache: %w", err)

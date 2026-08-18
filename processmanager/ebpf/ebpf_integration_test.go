@@ -15,6 +15,7 @@ import (
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/lpm"
+	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/rlimit"
 	"go.opentelemetry.io/ebpf-profiler/support"
 )
@@ -22,7 +23,7 @@ import (
 func loadTracers(t *testing.T) *ebpfMapsImpl {
 	t.Helper()
 
-	coll, err := support.LoadCollectionSpec(false)
+	coll, err := support.LoadCollectionSpec()
 	require.NoError(t, err)
 
 	restoreRlimit, err := rlimit.MaximizeMemlock()
@@ -33,7 +34,8 @@ func loadTracers(t *testing.T) *ebpfMapsImpl {
 	require.NoError(t, err)
 
 	return &ebpfMapsImpl{
-		pidPageToMappingInfo: pidPageToMappingInfo,
+		PidPageToMappingInfo: pidPageToMappingInfo,
+		errCounter:           make(map[metrics.MetricID]int64),
 	}
 }
 
@@ -63,7 +65,7 @@ func TestLPM(t *testing.T) {
 			err := impl.UpdatePidPageMappingInfo(test.pid, prefix, test.fileID, test.bias)
 			require.NoError(t, err)
 
-			fileID, bias, err := impl.LookupPidPageInformation(uint32(test.pid), test.rip)
+			fileID, bias, err := impl.LookupPidPageInformation(test.pid, test.rip)
 			if assert.NoError(t, err) {
 				assert.Equal(t, test.fileID, uint64(fileID))
 				assert.Equal(t, test.bias, bias)
@@ -79,6 +81,11 @@ func TestBatchOperations(t *testing.T) {
 	for _, mapType := range []cebpf.MapType{cebpf.Hash, cebpf.Array, cebpf.LPMTrie} {
 		t.Run(mapType.String(), func(t *testing.T) {
 			err := probeBatchOperations(mapType)
+			if err != nil {
+				require.ErrorIs(t, err, cebpf.ErrNotSupported)
+			}
+
+			err = probeBatchLookupAndDelete(mapType)
 			if err != nil {
 				require.ErrorIs(t, err, cebpf.ErrNotSupported)
 			}

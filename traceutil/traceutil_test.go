@@ -19,6 +19,38 @@ func TestLibpfEBPFFrameMarkerEquality(t *testing.T) {
 	assert.Equal(t, int(libpf.PHPFrame), support.FrameMarkerPHP)
 }
 
+func newTrace() *libpf.Trace {
+	trace := &libpf.Trace{}
+	trace.Frames.Append(&libpf.Frame{
+		Type:            libpf.NativeFrame,
+		AddressOrLineno: 0,
+		Mapping: libpf.NewFrameMapping(libpf.FrameMappingData{
+			File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+				FileID: libpf.NewFileID(0, 0),
+			}),
+		}),
+	})
+	trace.Frames.Append(&libpf.Frame{
+		Type:            libpf.NativeFrame,
+		AddressOrLineno: 1,
+		Mapping: libpf.NewFrameMapping(libpf.FrameMappingData{
+			File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+				FileID: libpf.NewFileID(1, 1),
+			}),
+		}),
+	})
+	trace.Frames.Append(&libpf.Frame{
+		Type:            libpf.NativeFrame,
+		AddressOrLineno: 2,
+		Mapping: libpf.NewFrameMapping(libpf.FrameMappingData{
+			File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+				FileID: libpf.NewFileID(2, 2),
+			}),
+		}),
+	})
+	return trace
+}
+
 func TestHashTrace(t *testing.T) {
 	tests := map[string]struct {
 		trace  *libpf.Trace
@@ -28,24 +60,11 @@ func TestHashTrace(t *testing.T) {
 			trace:  &libpf.Trace{},
 			result: libpf.NewTraceHash(0x6c62272e07bb0142, 0x62b821756295c58d)},
 		"python trace": {
-			trace: &libpf.Trace{
-				Linenos: []libpf.AddressOrLineno{0, 1, 2},
-				Files: []libpf.FileID{
-					libpf.NewFileID(0, 0),
-					libpf.NewFileID(1, 1),
-					libpf.NewFileID(2, 2),
-				},
-				FrameTypes: []libpf.FrameType{
-					libpf.NativeFrame,
-					libpf.NativeFrame,
-					libpf.NativeFrame,
-				}},
+			trace:  newTrace(),
 			result: libpf.NewTraceHash(0x21c6fe4c62868856, 0xcf510596eab68dc8)},
 	}
 
 	for name, testcase := range tests {
-		name := name
-		testcase := testcase
 		t.Run(name, func(t *testing.T) {
 			assert.Equal(t, testcase.result, HashTrace(testcase.trace))
 		})

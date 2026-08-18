@@ -6,31 +6,49 @@
 
 #include "types.h"
 
-// tracepoint__sched_process_exit is a tracepoint attached to the scheduler that stops processes.
-// Every time a processes stops this hook is triggered.
-SEC("tracepoint/sched/sched_process_exit")
-int tracepoint__sched_process_exit(void *ctx)
+// See /sys/kernel/tracing/events/sched/sched_process_free/format
+// for struct layout. This is pre-6.16 format which uses a fixed-size
+// (TASK_COMM_LEN) array for comm.
+struct sched_process_free_ctx_pre616 {
+  unsigned char skip[24];
+  pid_t pid;
+  int prio;
+};
+
+// This is the newer kernel version 6.16+ format.
+// The change was introduced upstream with
+// https://github.com/torvalds/linux/commit/155fd6c3e2f02efdc71a9b62888942efc217aff0
+struct sched_process_free_ctx {
+  unsigned char skip[12];
+  pid_t pid;
+  int prio;
+};
+
+static EBPF_INLINE int do_process_free(void *ctx, u32 pid)
 {
-  u64 pid_tgid = bpf_get_current_pid_tgid();
-  u32 pid      = (u32)(pid_tgid >> 32);
-  u32 tid      = (u32)(pid_tgid & 0xFFFFFFFF);
-
-  if (pid != tid) {
-    // Only if the thread group ID matched with the PID the process itself exits. If they don't
-    // match only a thread of the process stopped and we do not need to report this PID to
-    // userspace for further processing.
-    goto exit;
-  }
-
-  if (!bpf_map_lookup_elem(&reported_pids, &pid) && !pid_information_exists(ctx, pid)) {
+  if (!bpf_map_lookup_elem(&reported_pids, &pid) && !pid_information_exists(pid)) {
     // Only report PIDs that we explicitly track. This avoids sending kernel worker PIDs
     // to userspace.
     goto exit;
   }
 
-  if (report_pid(ctx, pid, RATELIMIT_ACTION_RESET)) {
+  if (report_pid(ctx, (u64)pid << 32 | pid, RATELIMIT_ACTION_RESET)) {
     increment_metric(metricID_NumProcExit);
   }
 exit:
   return 0;
+}
+
+// tracepoint__sched_process_free is a tracepoint attached to the scheduler that frees processes.
+// Every time a processes exits this hook is triggered.
+SEC("tracepoint/sched/sched_process_free/v2")
+int tracepoint__sched_process_free(struct sched_process_free_ctx *ctx)
+{
+  return do_process_free(ctx, ctx->pid);
+}
+
+SEC("tracepoint/sched/sched_process_free/v1")
+int tracepoint__sched_process_free_pre616(struct sched_process_free_ctx_pre616 *ctx)
+{
+  return do_process_free(ctx, ctx->pid);
 }

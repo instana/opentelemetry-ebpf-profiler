@@ -10,64 +10,28 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sync"
 	"time"
 	"unsafe"
 
-	cebpf "github.com/cilium/ebpf"
-
 	"go.opentelemetry.io/ebpf-profiler/libpf"
-	"go.opentelemetry.io/ebpf-profiler/libpf/xsync"
 	"go.opentelemetry.io/ebpf-profiler/nativeunwind/elfunwindinfo"
 	"go.opentelemetry.io/ebpf-profiler/process"
 	pm "go.opentelemetry.io/ebpf-profiler/processmanager"
-	"go.opentelemetry.io/ebpf-profiler/reporter"
-	"go.opentelemetry.io/ebpf-profiler/support"
+	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	tracertypes "go.opentelemetry.io/ebpf-profiler/tracer/types"
 )
 
 // #include <stdlib.h>
 // #include "../../support/ebpf/types.h"
 // int unwind_traces(u64 id, int debug, u64 tp_base, void *ctx);
+// void initialize_rodata_variables(u64 new_inv_pac_mask);
 import "C"
 
 // sliceBuffer creates a Go slice from C buffer
 func sliceBuffer(buf unsafe.Pointer, sz C.int) []byte {
 	return unsafe.Slice((*byte)(buf), int(sz))
 }
-
-// symbolizationCache collects and caches the interpreter manager's symbolization
-// callbacks to be used for trace stringification.
-type symbolizationCache struct {
-	files   map[libpf.FileID]string
-	symbols map[libpf.FrameID]*reporter.FrameMetadataArgs
-}
-
-func newSymbolizationCache() *symbolizationCache {
-	return &symbolizationCache{
-		files:   make(map[libpf.FileID]string),
-		symbols: make(map[libpf.FrameID]*reporter.FrameMetadataArgs),
-	}
-}
-
-func (c *symbolizationCache) ExecutableKnown(fileID libpf.FileID) bool {
-	_, exists := c.files[fileID]
-	return exists
-}
-
-func (c *symbolizationCache) ExecutableMetadata(args *reporter.ExecutableMetadataArgs) {
-	c.files[args.FileID] = args.FileName
-}
-
-func (c *symbolizationCache) FrameKnown(frameID libpf.FrameID) bool {
-	_, exists := c.symbols[frameID]
-	return exists
-}
-
-func (c *symbolizationCache) FrameMetadata(args *reporter.FrameMetadataArgs) {
-	c.symbols[args.FrameID] = args
-}
-
-func (c *symbolizationCache) ReportFallbackSymbol(libpf.FrameID, string) {}
 
 func generateErrorMap() (map[libpf.AddressOrLineno]string, error) {
 	file, err := os.Open("../errors-codegen/errors.json")
@@ -93,58 +57,72 @@ func generateErrorMap() (map[libpf.AddressOrLineno]string, error) {
 	return out, nil
 }
 
-var errorMap xsync.Once[map[libpf.AddressOrLineno]string]
+var errorMap = sync.OnceValues(generateErrorMap)
 
-func (c *symbolizationCache) symbolize(ty libpf.FrameType, fileID libpf.FileID,
-	lineNumber libpf.AddressOrLineno) (string, error) {
-	if ty.IsError() {
-		errMap, err := errorMap.GetOrInit(generateErrorMap)
+func formatFrame(frame *libpf.Frame) (string, error) {
+	if frame.Type.IsError() {
+		errMap, err := errorMap()
 		if err != nil {
 			return "", fmt.Errorf("unable to construct error map: %v", err)
 		}
-		errName, ok := (*errMap)[lineNumber]
+		errName, ok := errMap[frame.AddressOrLineno]
 		if !ok {
 			return "", fmt.Errorf(
-				"got invalid error code %d. forgot to `make generate`", lineNumber)
+				"got invalid error code %d. forgot to `make generate`",
+				frame.AddressOrLineno)
 		}
-		if ty == libpf.AbortFrame {
+		if frame.Type.IsAbort() {
 			return fmt.Sprintf("<unwinding aborted due to error %s>", errName), nil
 		}
 		return fmt.Sprintf("<error %s>", errName), nil
 	}
 
-	if data, ok := c.symbols[libpf.NewFrameID(fileID, lineNumber)]; ok {
-		return fmt.Sprintf("%s+%d in %s:%d",
-			data.FunctionName, data.FunctionOffset,
-			data.SourceFile, data.SourceLine), nil
+	if frame.FunctionName != libpf.NullString {
+		columnInfo := ""
+		if frame.SourceColumn != 0 {
+			columnInfo = fmt.Sprintf(":%d", frame.SourceColumn)
+		}
+		return fmt.Sprintf("%s+%d in %s:%d%s",
+			frame.FunctionName, frame.FunctionOffset,
+			frame.SourceFile, frame.SourceLine, columnInfo), nil
 	}
 
-	sourceFile, ok := c.files[fileID]
-	if !ok {
-		sourceFile = fmt.Sprintf("%08x", fileID)
+	if frame.Mapping.Valid() {
+		mf := frame.Mapping.Value().File.Value()
+		return fmt.Sprintf("%s+0x%x",
+			mf.FileName,
+			frame.AddressOrLineno), nil
 	}
-	return fmt.Sprintf("%s+0x%x", sourceFile, lineNumber), nil
+	return fmt.Sprintf("?+0x%x", frame.AddressOrLineno), nil
+}
+
+type traceReporter struct {
+	frames []string
+}
+
+func (t *traceReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceEventMeta) error {
+	t.frames = nil
+	frames := make([]string, 0, len(trace.Frames))
+	for _, f := range trace.Frames {
+		frame := f.Value()
+		frameText, err := formatFrame(&frame)
+		if err != nil {
+			return err
+		}
+		frames = append(frames, frameText)
+	}
+	t.frames = frames
+	return nil
 }
 
 func ExtractTraces(ctx context.Context, pr process.Process, debug bool,
-	lwpFilter libpf.Set[libpf.PID]) ([]ThreadInfo, error) {
+	lwpFilter libpf.Set[libpf.PID], faultAddresses map[uintptr]int) ([]ThreadInfo, error) {
 	todo, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	debugFlag := C.int(0)
 	if debug {
 		debugFlag = 1
-	}
-
-	dummyMaps := make(map[string]*cebpf.Map)
-	for _, mapName := range []string{"interpreter_offsets",
-		"pid_page_to_mapping_info", "stack_delta_page_to_info", "pid_page_to_mapping_info",
-		"dotnet_procs", "perl_procs", "py_procs", "hotspot_procs", "ruby_procs",
-		"php_procs", "v8_procs"} {
-		dummyMaps[mapName] = &cebpf.Map{}
-	}
-	for i := support.StackDeltaBucketSmallest; i <= support.StackDeltaBucketLargest; i++ {
-		dummyMaps[fmt.Sprintf("exe_id_to_%d_stack_deltas", i)] = &cebpf.Map{}
 	}
 
 	// In host agent we have set the default value for monitorInterval to 5 seconds. But as coredump
@@ -156,6 +134,8 @@ func ExtractTraces(ctx context.Context, pr process.Process, debug bool,
 	// panics. To avoid these panics we set monitorInterval to a high value so these reporter
 	// function are never used.
 	monitorInterval := time.Hour * 24
+
+	executableUnloadDelay := time.Minute * 5
 
 	// Check compatibility.
 	pid := pr.PID()
@@ -179,17 +159,21 @@ func ExtractTraces(ctx context.Context, pr process.Process, debug bool,
 	}
 
 	// Interfaces for the managers
-	ebpfCtx := newEBPFContext(pr)
+	ebpfCtx := newEBPFContext(pr, faultAddresses)
 	defer ebpfCtx.release()
 
+	inverse_pac_mask := ^(pr.GetMachineData().CodePACMask)
+	C.initialize_rodata_variables(C.u64(inverse_pac_mask))
+
 	coredumpEbpfMaps := ebpfMapsCoredump{ctx: ebpfCtx}
-	symCache := newSymbolizationCache()
+	traceReporter := traceReporter{}
 
 	// Instantiate managers and enable all tracers by default
 	includeTracers, _ := tracertypes.Parse("all")
 
-	manager, err := pm.New(todo, includeTracers, monitorInterval, &coredumpEbpfMaps,
-		pm.NewMapFileIDMapper(), symCache, elfunwindinfo.NewStackDeltaProvider(), false)
+	manager, err := pm.New(todo, includeTracers, monitorInterval, executableUnloadDelay,
+		&coredumpEbpfMaps, &traceReporter, nil, elfunwindinfo.NewStackDeltaProvider(),
+		false, libpf.Set[string]{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get Interpreter manager: %v", err)
 	}
@@ -211,16 +195,11 @@ func ExtractTraces(ctx context.Context, pr process.Process, debug bool,
 			return nil, fmt.Errorf("failed to unwind lwp %v: %v", thread.LWP, rc)
 		}
 		// Symbolize traces with interpreter manager
-		trace := manager.ConvertTrace(&ebpfCtx.trace)
-		tinfo := ThreadInfo{LWP: thread.LWP}
-		for i := range trace.FrameTypes {
-			frame, err := symCache.symbolize(trace.FrameTypes[i], trace.Files[i], trace.Linenos[i])
-			if err != nil {
-				return nil, err
-			}
-			tinfo.Frames = append(tinfo.Frames, frame)
-		}
-		info = append(info, tinfo)
+		manager.HandleTrace(&ebpfCtx.trace)
+		info = append(info, ThreadInfo{
+			LWP:    thread.LWP,
+			Frames: traceReporter.frames,
+		})
 	}
 
 	return info, nil

@@ -4,51 +4,39 @@
 package php // import "go.opentelemetry.io/ebpf-profiler/interpreter/php"
 
 import (
-	"bytes"
+	"debug/elf"
 	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
 	"unsafe"
 
-	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
 
 	"github.com/elastic/go-freelru"
 
 	"go.opentelemetry.io/ebpf-profiler/interpreter"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
+	"go.opentelemetry.io/ebpf-profiler/libpf/pfbufio"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
 	"go.opentelemetry.io/ebpf-profiler/support"
 )
 
-// #include "../../support/ebpf/types.h"
-import "C"
-
-//nolint:golint,stylecheck,revive
 const (
 	// This is used to check if the VM mode is the default one
 	// From https://github.com/php/php-src/blob/PHP-8.0/Zend/zend_vm_opcodes.h#L29
 	ZEND_VM_KIND_HYBRID = (1 << 2)
 )
 
-const (
-	// maxPHPRODataSize is the maximum PHP RO Data segment size to scan
-	// (currently the largest seen is about 9M)
-	maxPHPRODataSize = 16 * 1024 * 1024
-
-	// unknownFunctionName is the name to be used when it cannot be read from the
-	// interpreter, or explicit function name does not exist (global code not in function)
-	unknownFunctionName = "<unknown>"
-
+var (
 	// evalCodeFunctionName is a placeholder name to show that code has been evaluated
 	// using eval in PHP.
-	evalCodeFunctionName = "<eval'd code>"
-)
+	evalCodeFunctionName = libpf.Intern("<eval'd code>")
 
-var (
 	// regex for the interpreter executable
-	phpRegex     = regexp.MustCompile(".*/php(-cgi|-fpm)?[0-9.]*$|^php(-cgi|-fpm)?[0-9.]*$")
+	phpRegex = regexp.MustCompile(`.*/php(-cgi|-fpm)?[0-9.]*$|^php(-cgi|-fpm)?[0-9.]*$` +
+		`|.*/libphp.*\.so$`)
 	versionMatch = regexp.MustCompile(`^(\d+)\.(\d+)\.(\d+)`)
 
 	// compiler check to make sure the needed interfaces are satisfied
@@ -56,12 +44,12 @@ var (
 	_ interpreter.Instance = &phpInstance{}
 )
 
-func phpVersion(major, minor, release uint) uint {
+func phpVersion(major, minor, release uint32) uint32 {
 	return major*0x10000 + minor*0x100 + release
 }
 
 type phpData struct {
-	version uint
+	version uint32
 
 	// egAddr is the `executor_globals` symbol value which is needed by the eBPF
 	// program to build php backtraces.
@@ -74,7 +62,6 @@ type phpData struct {
 	rtAddr libpf.Address
 
 	// vmStructs reflects the PHP internal class names and the offsets of named field
-	//nolint:golint,stylecheck,revive
 	vmStructs struct {
 		// https://github.com/php/php-src/blob/PHP-7.4/Zend/zend_globals.h#L135
 		zend_executor_globals struct {
@@ -82,15 +69,21 @@ type phpData struct {
 		}
 		// https://github.com/php/php-src/blob/PHP-7.4/Zend/zend_compile.h#L503
 		zend_execute_data struct {
-			opline, function  uint
-			this_type_info    uint
-			prev_execute_data uint
+			opline, function  uint8
+			this_type_info    uint8
+			prev_execute_data uint8
 		}
 		// https://github.com/php/php-src/blob/PHP-7.4/Zend/zend_compile.h#L483
 		zend_function struct {
-			common_type, common_funcname          uint
-			op_array_filename, op_array_linestart uint
-			Sizeof                                uint
+			common_type, common_funcname uint8
+			common_scope                 uint
+			op_array_filename            uint
+			op_array_linestart           uint
+			Sizeof                       uint
+		}
+		// https://github.com/php/php-src/blob/PHP-8.0/Zend/zend.h#L107
+		zend_class_entry struct {
+			name uint
 		}
 		// https://github.com/php/php-src/blob/PHP-7.4/Zend/zend_types.h#L235
 		zend_string struct {
@@ -98,7 +91,7 @@ type phpData struct {
 		}
 		// https://github.com/php/php-src/blob/PHP-7.4/Zend/zend_compile.h#L136
 		zend_op struct {
-			lineno uint
+			lineno uint8
 		}
 	}
 }
@@ -109,25 +102,25 @@ func (d *phpData) String() string {
 }
 
 func (d *phpData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libpf.Address,
-	rm remotememory.RemoteMemory) (interpreter.Instance, error) {
-	addrToFunction, err :=
-		freelru.New[libpf.Address, *phpFunction](interpreter.LruFunctionCacheSize,
-			libpf.Address.Hash32)
+	rm remotememory.RemoteMemory,
+) (interpreter.Instance, error) {
+	addrToFunction, err := freelru.New[libpf.Address, *phpFunction](interpreter.LruFunctionCacheSize,
+		libpf.Address.Hash32)
 	if err != nil {
 		return nil, err
 	}
 
 	vms := &d.vmStructs
-	data := C.PHPProcInfo{
-		current_execute_data: C.u64(d.egAddr+bias) +
-			C.u64(vms.zend_executor_globals.current_execute_data),
-		jit_return_address:                  C.u64(d.rtAddr + bias),
-		zend_execute_data_function:          C.u8(vms.zend_execute_data.function),
-		zend_execute_data_opline:            C.u8(vms.zend_execute_data.opline),
-		zend_execute_data_prev_execute_data: C.u8(vms.zend_execute_data.prev_execute_data),
-		zend_execute_data_this_type_info:    C.u8(vms.zend_execute_data.this_type_info),
-		zend_function_type:                  C.u8(vms.zend_function.common_type),
-		zend_op_lineno:                      C.u8(vms.zend_op.lineno),
+	data := support.PHPProcInfo{
+		Current_execute_data: uint64(d.egAddr+bias) +
+			uint64(vms.zend_executor_globals.current_execute_data),
+		Jit_return_address:                  uint64(d.rtAddr + bias),
+		Zend_execute_data_function:          vms.zend_execute_data.function,
+		Zend_execute_data_opline:            vms.zend_execute_data.opline,
+		Zend_execute_data_prev_execute_data: vms.zend_execute_data.prev_execute_data,
+		Zend_execute_data_this_type_info:    vms.zend_execute_data.this_type_info,
+		Zend_function_type:                  vms.zend_function.common_type,
+		Zend_op_lineno:                      vms.zend_op.lineno,
 	}
 	if err := ebpf.UpdateProcData(libpf.PHP, pid, unsafe.Pointer(&data)); err != nil {
 		return nil, err
@@ -149,42 +142,43 @@ func (d *phpData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libpf
 	return instance, nil
 }
 
-func versionExtract(rodata string) (uint, error) {
+func (d *phpData) Unload(_ interpreter.EbpfHandler) {
+}
+
+func versionExtract(rodata string) (uint32, error) {
 	matches := versionMatch.FindStringSubmatch(rodata)
 	if matches == nil {
 		return 0, errors.New("no valid PHP version string found")
 	}
 
-	major, _ := strconv.Atoi(matches[1])
-	minor, _ := strconv.Atoi(matches[2])
-	release, _ := strconv.Atoi(matches[3])
-	return phpVersion(uint(major), uint(minor), uint(release)), nil
+	major, _ := strconv.ParseUint(matches[1], 10, 32)
+	minor, _ := strconv.ParseUint(matches[2], 10, 32)
+	release, _ := strconv.ParseUint(matches[3], 10, 32)
+	return phpVersion(uint32(major), uint32(minor), uint32(release)), nil
 }
 
-func determinePHPVersion(ef *pfelf.File) (uint, error) {
+func determinePHPVersion(ef *pfelf.File) (uint32, error) {
 	// There is no ideal way to get the PHP version. This just searches
 	// for a known string with the version number from .rodata.
 	if ef.ROData == nil {
 		return 0, errors.New("no RO data")
 	}
 
-	needle := []byte("X-Powered-By: PHP/")
-	for _, segment := range ef.ROData {
-		rodata, err := segment.Data(maxPHPRODataSize)
-		if err != nil {
-			return 0, err
-		}
-		idx := bytes.Index(rodata, needle)
-		if idx < 0 {
-			continue
-		}
+	rdr := pfbufio.GetReader()
+	defer pfbufio.PutReader(rdr)
 
-		idx += len(needle)
-		zeroIdx := bytes.IndexByte(rodata[idx:], 0)
-		if zeroIdx < 0 {
+	needle := []byte("X-Powered-By: PHP/")
+	for _, seg := range ef.ROData {
+		rdr.Init(ef.Underlying(), int64(seg.Off), int64(seg.Filesz))
+		_, err := rdr.SearchSlice(needle)
+		if err != nil {
 			continue
 		}
-		version, err := versionExtract(string(rodata[idx : idx+zeroIdx]))
+		verString, err := rdr.ReadString(0)
+		if err != nil {
+			continue
+		}
+		version, err := versionExtract(verString)
 		if err != nil {
 			continue
 		}
@@ -204,21 +198,23 @@ func recoverExecuteExJumpLabelAddress(ef *pfelf.File) (libpf.SymbolValue, error)
 	// executor function, has been such at least since PHP7.0. This is guaranteed
 	// to be the vm executor function in PHP JIT'd code, since the JIT is (currently)
 	// inoperable with overridden execute_ex's
-	executeExAddr, err := ef.LookupSymbolAddress("execute_ex")
-	if err != nil {
-		return libpf.SymbolValueInvalid,
-			fmt.Errorf("could not find execute_ex: %w", err)
-	}
 
 	// The address we care about varies from being 47 bytes in to about 107 bytes in,
-	// so we'll read 128 bytes. This might need to be adjusted up in future.
-	code := make([]byte, 128)
-	if _, err = ef.ReadVirtualMemory(code, int64(executeExAddr)); err != nil {
+	// so we'll cap at 128 bytes. This might need to be adjusted up in future.
+	sym, code, err := ef.SymbolData("execute_ex", 128)
+	if err != nil {
 		return libpf.SymbolValueInvalid,
-			fmt.Errorf("could not read from executeExAddr: %w", err)
+			fmt.Errorf("unable to read 'execute_ex': %w", err)
 	}
-
-	returnAddress, err := retrieveExecuteExJumpLabelAddressWrapper(code, executeExAddr)
+	var returnAddress libpf.SymbolValue
+	switch ef.Machine {
+	case elf.EM_AARCH64:
+		returnAddress, err = retrieveExecuteExJumpLabelAddressARM(code, sym.Address)
+	case elf.EM_X86_64:
+		returnAddress, err = retrieveExecuteExJumpLabelAddressX86(code, sym.Address)
+	default:
+		return returnAddress, fmt.Errorf("unsupported architecture: %s", ef.Machine)
+	}
 	if err != nil {
 		return libpf.SymbolValueInvalid,
 			fmt.Errorf("reading the return address from execute_ex failed (%w)",
@@ -235,23 +231,25 @@ func determineVMKind(ef *pfelf.File) (uint, error) {
 
 	// This is a publicly exposed function in PHP that returns the VM type
 	// This has been implemented in PHP since at least 7.2
-	vmKindAddr, err := ef.LookupSymbolAddress("zend_vm_kind")
-	if err != nil {
-		return 0, fmt.Errorf("zend_vm_kind not found: %w", err)
-	}
 
 	// We should only need around 32 bytes here, since this function should be
 	// really short (e.g a mov and a ret).
-	code := make([]byte, 32)
-	if _, err = ef.ReadVirtualMemory(code, int64(vmKindAddr)); err != nil {
-		return 0, fmt.Errorf("could not read from zend_vm_kind: %w", err)
+	_, code, err := ef.SymbolData("zend_vm_kind", 64)
+	if err != nil {
+		return 0, fmt.Errorf("unable to read 'zend_vm_kind': %w", err)
 	}
-
-	vmKind, err := retrieveZendVMKindWrapper(code)
+	var vmKind uint
+	switch ef.Machine {
+	case elf.EM_AARCH64:
+		vmKind, err = retrieveZendVMKindARM(code)
+	case elf.EM_X86_64:
+		vmKind, err = retrieveZendVMKindX86(code)
+	default:
+		return 0, fmt.Errorf("unsupported architecture: %s", ef.Machine)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("an error occurred decoding zend_vm_kind: %w", err)
 	}
-
 	return vmKind, nil
 }
 
@@ -270,9 +268,9 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		return nil, err
 	}
 
-	// Only tested on PHP7.3-PHP8.3. Other similar versions probably only require
+	// Only tested on PHP7.3-PHP8.4. Other similar versions probably only require
 	// tweaking the offsets.
-	var minVer, maxVer = phpVersion(7, 3, 0), phpVersion(8, 4, 0)
+	minVer, maxVer := phpVersion(7, 3, 0), phpVersion(8, 5, 0)
 	if version < minVer || version >= maxVer {
 		return nil, fmt.Errorf("PHP version %d.%d.%d (need >= %d.%d and < %d.%d)",
 			(version>>16)&0xff, (version>>8)&0xff, version&0xff,
@@ -332,6 +330,7 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	vms.zend_execute_data.prev_execute_data = 48
 	vms.zend_function.common_type = 0
 	vms.zend_function.common_funcname = 8
+	vms.zend_function.common_scope = 16
 	vms.zend_function.op_array_filename = 128
 	vms.zend_function.op_array_linestart = 136
 	// Note: the sizeof here isn't actually the sizeof the
@@ -340,8 +339,13 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	// need at most 168 bytes.
 	vms.zend_function.Sizeof = 168
 	vms.zend_string.val = 24
+	vms.zend_class_entry.name = 8
 	vms.zend_op.lineno = 24
 	switch {
+	case version >= phpVersion(8, 4, 0):
+		vms.zend_function.op_array_filename = 168
+		vms.zend_function.op_array_linestart = 176
+		vms.zend_function.Sizeof = 184
 	case version >= phpVersion(8, 3, 0):
 		vms.zend_function.op_array_filename = 144
 		vms.zend_function.op_array_linestart = 152
