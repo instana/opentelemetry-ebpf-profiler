@@ -1,5 +1,5 @@
 .PHONY: all all-common clean ebpf generate generate-collector test test-deps \
-	test-junit protobuf docker-image agent legal integration-test-binaries \
+	test-junit protobuf docker-image agent test-docker legal integration-test-binaries \
 	codespell lint ebpf-profiler format format-ebpf format-go pprof-execs \
 	pprof_1_23 pprof_1_24 pprof_1_24_cgo otelcol-ebpf-profiler \
 	rust-components rust-targets rust-tests vanity-import-check vanity-import-fix \
@@ -242,6 +242,10 @@ agent:
 debug-agent:
 	docker run -v "$$PWD":/agent -v $(SYSROOT_PATH):/usr/sysroot $(TTY_IT_OPT) --rm --user $(shell id -u):$(shell id -g) $(BUILD_IMAGE) \
 	   "make COMPILER_TARGET=$(COMPILER_TARGET) TARGET_ARCH=$(TARGET_ARCH) VERSION=$(VERSION) REVISION=$(REVISION) BUILD_TIMESTAMP=$(BUILD_TIMESTAMP) debug"
+
+test-docker:
+	docker run -v "$$PWD":/agent -v $(SYSROOT_PATH):/usr/sysroot $(TTY_IT_OPT) --rm --user $(shell id -u):$(shell id -g) $(BUILD_IMAGE) \
+	   "make COMPILER_TARGET=$(COMPILER_TARGET) TARGET_ARCH=$(TARGET_ARCH) test"
 
 legal:
 	go tool $(GO_TOOLS) go-licenses save --force . --save_path=LICENSES
