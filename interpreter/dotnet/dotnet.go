@@ -103,11 +103,11 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"sync"
 
-	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
 
 	"go.opentelemetry.io/ebpf-profiler/interpreter"
-	"go.opentelemetry.io/ebpf-profiler/libpf"
 )
 
 const (
@@ -125,9 +125,6 @@ var (
 	// regex for the core language runtime
 	dotnetRegex = regexp.MustCompile(`/(\d+)\.(\d+).(\d+)/libcoreclr.so$`)
 
-	// The FileID used for Dotnet stub frames. Same FileID as in other interpreters.
-	stubsFileID = libpf.NewFileID(0x578b, 0x1d)
-
 	// compiler check to make sure the needed interfaces are satisfied
 	_ interpreter.Data     = &dotnetData{}
 	_ interpreter.Instance = &dotnetInstance{}
@@ -138,6 +135,10 @@ func dotnetVer(x, y, z uint32) uint32 {
 	return (x << 24) + (y << 16) + z
 }
 
+var dotnetGlobalInit = sync.OnceValue(func() error {
+	return globalPeCache.init()
+})
+
 func Loader(_ interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpreter.Data, error) {
 	// The dotnet DSOs are in a directory with the version such as:
 	// /usr/lib/dotnet/shared/Microsoft.NETCore.App/6.0.25/libcoreclr.so
@@ -147,13 +148,13 @@ func Loader(_ interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interprete
 	if matches == nil {
 		return nil, nil
 	}
-	major, _ := strconv.Atoi(matches[1])
-	minor, _ := strconv.Atoi(matches[2])
-	release, _ := strconv.Atoi(matches[3])
+	major, _ := strconv.ParseUint(matches[1], 10, 32)
+	minor, _ := strconv.ParseUint(matches[2], 10, 32)
+	release, _ := strconv.ParseUint(matches[3], 10, 32)
 	version := dotnetVer(uint32(major), uint32(minor), uint32(release))
 
 	// dotnet8 requires additional support for RangeSectionMap and MethodDesc updates
-	if version < dotnetVer(6, 0, 0) || version >= dotnetVer(9, 0, 0) {
+	if version < dotnetVer(6, 0, 0) || version >= dotnetVer(11, 0, 0) {
 		return nil, fmt.Errorf("dotnet version %d.%d.%d not supported",
 			major, minor, release)
 	}
@@ -168,13 +169,20 @@ func Loader(_ interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interprete
 		return nil, err
 	}
 
-	log.Debugf("Dotnet DAC table at %x", addr)
+	if err := dotnetGlobalInit(); err != nil {
+		return nil, err
+	}
+
+	// cdac is optional and present starting dotnet9
+	cdac, _ := ef.LookupSymbolAddress("DotNetRuntimeContractDescriptor")
+
+	log.Debugf("Dotnet DAC table at %x, CDAC header at %x", addr, cdac)
 
 	d := &dotnetData{
 		version:      version,
+		machine:      ef.Machine,
 		dacTableAddr: addr,
+		cdacDescAddr: cdac,
 	}
-	d.loadIntrospectionData()
-
 	return d, nil
 }

@@ -5,19 +5,21 @@ package metrics // import "go.opentelemetry.io/ebpf-profiler/metrics"
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/json"
+	"fmt"
 	"sync"
+	"time"
 
-	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
 
-	"go.opentelemetry.io/ebpf-profiler/libpf"
-	"go.opentelemetry.io/ebpf-profiler/reporter"
+	"go.opentelemetry.io/otel/metric"
 )
 
 var (
 	// prevTimestamp holds the timestamp of the buffered metrics
-	prevTimestamp libpf.UnixTime32
+	prevTimestamp uint32
 
 	// metricsBuffer buffers the metricsBuffer for the timestamp assigned to prevTimestamp
 	metricsBuffer = make([]Metric, IDMax)
@@ -37,44 +39,62 @@ var (
 
 	// Used in fallback checks, e.g. to avoid sending "counters" with 0 values
 	metricTypes map[MetricID]MetricType
+
+	// OTel metric instrumentation
+	counters = map[MetricID]metric.Int64Counter{}
+	gauges   = map[MetricID]metric.Int64Gauge{}
 )
 
-func init() {
-	defs, err := GetDefinitions()
-	if err != nil {
-		panic("extracting definitions from metrics.json")
-	}
-
+func Start(meter metric.Meter) {
+	defs := GetDefinitions()
 	metricTypes = make(map[MetricID]MetricType, len(defs))
 	for _, md := range defs {
+		if md.Obsolete || md.Field == "" {
+			continue
+		}
 		metricTypes[md.ID] = md.Type
+		switch typ := md.Type; typ {
+		case MetricTypeCounter:
+			counter, err := meter.Int64Counter(md.Field,
+				metric.WithDescription(md.Description),
+				metric.WithUnit(md.Unit))
+			if err != nil {
+				log.Errorf("Creating Int64Counter: %v", err)
+				continue
+			}
+			counters[md.ID] = counter
+		case MetricTypeGauge:
+			gauge, err := meter.Int64Gauge(md.Field,
+				metric.WithDescription(md.Description),
+				metric.WithUnit(md.Unit))
+			if err != nil {
+				log.Errorf("Creating Int64Gauge: %v", err)
+				continue
+			}
+			gauges[md.ID] = gauge
+		default:
+			panic(fmt.Sprintf("Unknown metric type: %v", typ))
+		}
 	}
 }
 
-// reporterImpl allows swapping out the global metrics reporter.
-//
-// nil is a valid value indicating that metrics should be voided.
-var reporterImpl reporter.MetricsReporter
-
-// SetReporter sets the reporter instance used to send out metrics.
-func SetReporter(r reporter.MetricsReporter) {
-	reporterImpl = r
-}
-
-// report converts and reports collected metrics via the reporter package.
-func report() {
-	ids := make([]uint32, nMetrics)
-	values := make([]int64, nMetrics)
-
-	for i := 0; i < nMetrics; i++ {
-		ids[i] = uint32(metricsBuffer[i].ID)
-		values[i] = int64(metricsBuffer[i].Value)
+// report converts and reports collected metrics via OTel metrics.
+// Allow for report to be overridden in the test.
+var report = func() {
+	ctx := context.Background()
+	for i := range nMetrics {
+		metric := metricsBuffer[i]
+		switch typ := metricTypes[metric.ID]; typ {
+		case MetricTypeCounter:
+			if counter, ok := counters[metric.ID]; ok {
+				counter.Add(ctx, int64(metric.Value))
+			}
+		case MetricTypeGauge:
+			if gauge, ok := gauges[metric.ID]; ok {
+				gauge.Record(ctx, int64(metric.Value))
+			}
+		}
 	}
-
-	if reporterImpl != nil {
-		reporterImpl.ReportMetrics(uint32(prevTimestamp), ids, values)
-	}
-
 	nMetrics = 0
 	for idx := range metricIDSet {
 		metricIDSet[idx] = 0
@@ -98,7 +118,7 @@ func report() {
 // This ensures that the buffered metrics from the previous timestamp are sent
 // with the correctly assigned TSMetric.Timestamp.
 func AddSlice(newMetrics []Metric) {
-	now := libpf.UnixTime32(libpf.NowAsUInt32())
+	now := uint32(time.Now().Unix())
 
 	mutex.Lock()
 	defer mutex.Unlock()
@@ -116,6 +136,11 @@ func AddSlice(newMetrics []Metric) {
 		if metric.ID <= IDInvalid || metric.ID >= IDMax {
 			log.Errorf("Metric value %d out of range [%d,%d]- needs investigation",
 				metric.ID, IDInvalid+1, IDMax-1)
+			continue
+		}
+
+		if _, ok := metricTypes[metric.ID]; !ok {
+			log.Warnf("Invalid metric id %d, skipping", metric.ID)
 			continue
 		}
 
@@ -175,15 +200,20 @@ func Add(id MetricID, value MetricValue) {
 // and earlier.
 
 // GetDefinitions returns the metric definitions from the embedded metrics.json file.
-func GetDefinitions() ([]MetricDefinition, error) {
-	var definitions []MetricDefinition
+func GetDefinitions() []MetricDefinition {
+	var defs []MetricDefinition
 
 	dec := json.NewDecoder(bytes.NewReader(metricsJSON))
 	dec.DisallowUnknownFields()
 
-	err := dec.Decode(&definitions)
+	err := dec.Decode(&defs)
 	if err != nil {
-		return nil, err
+		panic(fmt.Sprintf("extracting definitions from metrics.json: %v", err))
 	}
-	return definitions, nil
+	for i, d := range defs {
+		if d.Field == "" && d.ID != 0 {
+			panic(fmt.Sprintf("metric %d: missing required field", i))
+		}
+	}
+	return defs
 }

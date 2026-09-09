@@ -10,22 +10,33 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"syscall"
 	"unsafe"
 
+	"go.opentelemetry.io/ebpf-profiler/kallsyms"
+	"go.opentelemetry.io/ebpf-profiler/libpf"
+	"go.opentelemetry.io/ebpf-profiler/pacmask"
 	"go.opentelemetry.io/ebpf-profiler/rlimit"
+	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/tracer/types"
 
 	cebpf "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/link"
-	log "github.com/sirupsen/logrus"
-
-	"go.opentelemetry.io/ebpf-profiler/libpf"
-	"go.opentelemetry.io/ebpf-profiler/pacmask"
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
 )
 
-// #include "../support/ebpf/types.h"
-import "C"
+// sysConfigVars supports collecting system configuration information.
+type sysConfigVars struct {
+	tpbase_offset       uint64
+	task_stack_offset   uint32
+	stack_ptregs_offset uint32
+}
+
+var (
+	errSystemAnalysisNotHandled = errors.New("system analysis request was not handled")
+	errSystemAnalysisFailed     = errors.New("system analysis helper failed")
+)
 
 // memberByName resolves btf Member from a Struct with given name
 func memberByName(t *btf.Struct, field string) (*btf.Member, error) {
@@ -41,7 +52,7 @@ func memberByName(t *btf.Struct, field string) (*btf.Member, error) {
 // can refer to field within nested structs.
 func calculateFieldOffset(t btf.Type, fieldSpec string) (uint, error) {
 	offset := uint(0)
-	for _, field := range strings.Split(fieldSpec, ".") {
+	for field := range strings.SplitSeq(fieldSpec, ".") {
 		st, ok := t.(*btf.Struct)
 		if !ok {
 			return 0, fmt.Errorf("field '%s' is not a struct", field)
@@ -72,7 +83,7 @@ func getTSDBaseFieldSpec() string {
 }
 
 // parseBTF resolves the SystemConfig data from kernel BTF
-func parseBTF(syscfg *C.SystemConfig) error {
+func parseBTF(vars *sysConfigVars) error {
 	fh, err := os.Open("/sys/kernel/btf/vmlinux")
 	if err != nil {
 		return err
@@ -94,26 +105,27 @@ func parseBTF(syscfg *C.SystemConfig) error {
 	if err != nil {
 		return err
 	}
-	syscfg.task_stack_offset = C.u32(stackOffset)
+	vars.task_stack_offset = uint32(stackOffset)
 
 	tpbaseOffset, err := calculateFieldOffset(taskStruct, getTSDBaseFieldSpec())
 	if err != nil {
 		return err
 	}
-	syscfg.tpbase_offset = C.u64(tpbaseOffset)
+	vars.tpbase_offset = uint64(tpbaseOffset)
 
 	return nil
 }
 
 // executeSystemAnalysisBpfCode will execute given analysis program with the address argument.
 func executeSystemAnalysisBpfCode(progSpec *cebpf.ProgramSpec, maps map[string]*cebpf.Map,
-	address libpf.SymbolValue) (code []byte, addr uint64, err error) {
+	address libpf.SymbolValue,
+) (code []byte, addr uint64, err error) {
 	systemAnalysis := maps["system_analysis"]
 
 	key0 := uint32(0)
-	data := C.SystemAnalysis{
-		pid:     C.uint(os.Getpid()),
-		address: C.u64(address),
+	data := support.SystemAnalysis{
+		Pid:     uint32(os.Getpid()),
+		Address: uint64(address),
 	}
 
 	if err = systemAnalysis.Update(unsafe.Pointer(&key0), unsafe.Pointer(&data),
@@ -142,7 +154,8 @@ func executeSystemAnalysisBpfCode(progSpec *cebpf.ProgramSpec, maps map[string]*
 	case cebpf.RawTracepoint:
 		progLink, err = link.AttachRawTracepoint(link.RawTracepointOptions{
 			Name:    "sys_enter",
-			Program: prog})
+			Program: prog,
+		})
 	case cebpf.TracePoint:
 		progLink, err = link.Tracepoint("syscalls", "sys_enter_bpf", prog, nil)
 	default:
@@ -152,19 +165,37 @@ func executeSystemAnalysisBpfCode(progSpec *cebpf.ProgramSpec, maps map[string]*
 		return nil, 0, fmt.Errorf("failed to configure tracepoint: %v", err)
 	}
 	err = systemAnalysis.Lookup(unsafe.Pointer(&key0), unsafe.Pointer(&data))
-	progLink.Close()
+	_ = progLink.Close()
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to get analysis data: %v", err)
 	}
+	if err = validateSystemAnalysisResult(data, address); err != nil {
+		return nil, 0, err
+	}
 
-	//nolint:gocritic
-	return C.GoBytes(unsafe.Pointer(&data.code[0]), C.int(len(data.code))),
-		uint64(data.address), nil
+	return data.Code[:], data.Address, nil
+}
+
+func validateSystemAnalysisResult(data support.SystemAnalysis, address libpf.SymbolValue) error {
+	if data.Pid != 0 {
+		return fmt.Errorf("%w for pid %d at 0x%x", errSystemAnalysisNotHandled, data.Pid, address)
+	}
+
+	if data.Err != 0 {
+		if data.Err < 0 {
+			return fmt.Errorf("%w at 0x%x: %w (helper err=%d)", errSystemAnalysisFailed, address, syscall.Errno(-data.Err), data.Err)
+		}
+
+		return fmt.Errorf("%w at 0x%x: helper err=%d", errSystemAnalysisFailed, address, data.Err)
+	}
+
+	return nil
 }
 
 // loadKernelCode will request the ebpf code to read the first X bytes from given address.
 func loadKernelCode(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map,
-	address libpf.SymbolValue) ([]byte, error) {
+	address libpf.SymbolValue,
+) ([]byte, error) {
 	code, _, err := executeSystemAnalysisBpfCode(coll.Programs["read_kernel_memory"], maps, address)
 	if err != nil {
 		log.Warnf("Failed to load code: %v.\n"+
@@ -176,27 +207,30 @@ func loadKernelCode(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map,
 // readTaskStruct will request the ebpf code to read bytes from the given offset from
 // the current task_struct.
 func readTaskStruct(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map,
-	address libpf.SymbolValue) (code []byte, addr uint64, err error) {
+	address libpf.SymbolValue,
+) (code []byte, addr uint64, err error) {
 	return executeSystemAnalysisBpfCode(coll.Programs["read_task_struct"], maps, address)
 }
 
 // determineStackPtregs determines the offset of `struct pt_regs` within the entry stack
 // when the `stack` field offset within `task_struct` is already known.
 func determineStackPtregs(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map,
-	syscfg *C.SystemConfig) error {
-	data, ptregs, err := readTaskStruct(coll, maps, libpf.SymbolValue(syscfg.task_stack_offset))
+	vars *sysConfigVars,
+) error {
+	data, ptregs, err := readTaskStruct(coll, maps, libpf.SymbolValue(vars.task_stack_offset))
 	if err != nil {
 		return err
 	}
 	stackBase := binary.LittleEndian.Uint64(data)
-	syscfg.stack_ptregs_offset = C.u32(ptregs - stackBase)
+	vars.stack_ptregs_offset = uint32(ptregs - stackBase)
 	return nil
 }
 
 // determineStackLayout scans `task_struct` for offset of the `stack` field, and using
 // its value determines the offset of `struct pt_regs` within the entry stack.
 func determineStackLayout(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map,
-	syscfg *C.SystemConfig) error {
+	vars *sysConfigVars,
+) error {
 	const maxTaskStructSize = 8 * 1024
 	const maxStackSize = 64 * 1024
 
@@ -215,8 +249,8 @@ func determineStackLayout(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map
 				continue
 			}
 			if ptregs > stackBase && ptregs < stackBase+maxStackSize {
-				syscfg.task_stack_offset = C.u32(offs + i)
-				syscfg.stack_ptregs_offset = C.u32(ptregs - stackBase)
+				vars.task_stack_offset = uint32(offs + i)
+				vars.stack_ptregs_offset = uint32(ptregs - stackBase)
 				return nil
 			}
 		}
@@ -225,52 +259,120 @@ func determineStackLayout(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map
 	return errors.New("unable to find task stack offset")
 }
 
-func loadSystemConfig(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map,
-	kernelSymbols *libpf.SymbolMap, includeTracers types.IncludedTracers,
-	offCPUThreshold uint32, filterErrorFrames bool) error {
-	pacMask := pacmask.GetPACMask()
-	if pacMask != 0 {
-		log.Infof("Determined PAC mask to be 0x%016X", pacMask)
-	} else {
-		log.Debug("PAC is not enabled on the system.")
+// prepareAnalysis creates a new CollectionSpec for the system analysis.
+func prepareAnalysis(orig *cebpf.CollectionSpec) (*cebpf.CollectionSpec, map[string]*cebpf.Map, error) {
+	new := &cebpf.CollectionSpec{
+		Maps:     make(map[string]*cebpf.MapSpec),
+		Programs: make(map[string]*cebpf.ProgramSpec),
 	}
-	syscfg := C.SystemConfig{
-		inverse_pac_mask:       ^C.u64(pacMask),
-		drop_error_only_traces: C.bool(filterErrorFrames),
-		off_cpu_threshold:      C.u32(offCPUThreshold),
+	new.Maps["system_analysis"] = orig.Maps["system_analysis"].Copy()
+	new.Maps[".rodata.var"] = orig.Maps[".rodata.var"].Copy()
+	if rodata, ok := orig.Maps[".rodata"]; ok {
+		new.Maps[".rodata"] = rodata.Copy()
 	}
 
-	if err := parseBTF(&syscfg); err != nil {
+	new.Programs["read_kernel_memory"] = orig.Programs["read_kernel_memory"].Copy()
+	new.Programs["read_task_struct"] = orig.Programs["read_task_struct"].Copy()
+
+	maps := make(map[string]*cebpf.Map)
+
+	if err := loadAllMaps(new, &Config{}, maps); err != nil {
+		return nil, nil, err
+	}
+
+	if err := rewriteMaps(new, maps); err != nil {
+		return nil, nil, fmt.Errorf("failed to rewrite maps: %v", err)
+	}
+
+	return new, maps, nil
+}
+
+func determineSysConfig(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map,
+	kmod *kallsyms.Module, includeTracers types.IncludedTracers, vars *sysConfigVars,
+) error {
+	if err := parseBTF(vars); err != nil {
 		log.Infof("Using binary analysis (BTF not available: %s)", err)
 
-		if err = determineStackLayout(coll, maps, &syscfg); err != nil {
+		if err = determineStackLayout(coll, maps, vars); err != nil {
 			return err
 		}
 
-		if includeTracers.Has(types.PerlTracer) || includeTracers.Has(types.PythonTracer) {
+		if includeTracers.Has(types.PerlTracer) || includeTracers.Has(types.PythonTracer) ||
+			includeTracers.Has(types.Labels) {
 			var tpbaseOffset uint64
-			tpbaseOffset, err = loadTPBaseOffset(coll, maps, kernelSymbols)
+			tpbaseOffset, err = loadTPBaseOffset(coll, maps, kmod)
 			if err != nil {
 				return err
 			}
-			syscfg.tpbase_offset = C.u64(tpbaseOffset)
+			vars.tpbase_offset = tpbaseOffset
 		}
 	} else {
 		// Sadly BTF does not currently include THREAD_SIZE which is needed
 		// to calculate the offset of struct pt_regs in the entry stack.
 		// The value also depends of some kernel configurations, so lets
 		// analyze it dynamically for now.
-		if err = determineStackPtregs(coll, maps, &syscfg); err != nil {
+		if err = determineStackPtregs(coll, maps, vars); err != nil {
 			return err
 		}
 	}
 
 	log.Infof("Found offsets: task stack %#x, pt_regs %#x, tpbase %#x",
-		syscfg.task_stack_offset,
-		syscfg.stack_ptregs_offset,
-		syscfg.tpbase_offset)
+		vars.task_stack_offset,
+		vars.stack_ptregs_offset,
+		vars.tpbase_offset)
 
-	key0 := uint32(0)
-	return maps["system_config"].Update(unsafe.Pointer(&key0), unsafe.Pointer(&syscfg),
-		cebpf.UpdateAny)
+	return nil
+}
+
+// loadRodataVars initializes RODATA variables for the eBPF programs.
+func loadRodataVars(coll *cebpf.CollectionSpec, kmod *kallsyms.Module, cfg *Config) error {
+	if cfg.VerboseMode {
+		if err := coll.Variables["with_debug_output"].Set(uint32(1)); err != nil {
+			return fmt.Errorf("failed to set debug output: %v", err)
+		}
+	}
+
+	if err := coll.Variables["off_cpu_threshold"].Set(cfg.OffCPUThreshold); err != nil {
+		return fmt.Errorf("failed to set off_cpu_threshold: %v", err)
+	}
+
+	if err := coll.Variables["filter_error_frames"].Set(cfg.FilterErrorFrames); err != nil {
+		return fmt.Errorf("failed to set drop_error_only_traces: %v", err)
+	}
+
+	if err := coll.Variables["filter_idle_frames"].Set(cfg.FilterIdleFrames); err != nil {
+		return fmt.Errorf("failed to set debug output: %v", err)
+	}
+
+	pacMask := pacmask.GetPACMask()
+	if pacMask != 0 {
+		log.Infof("Determined PAC mask to be 0x%016X", pacMask)
+	} else {
+		log.Debug("PAC is not enabled on the system.")
+	}
+	if err := coll.Variables["inverse_pac_mask"].Set(^pacMask); err != nil {
+		return fmt.Errorf("failed to set inverse_pac_mask: %v", err)
+	}
+
+	rodataVars := sysConfigVars{}
+
+	systemAnalysisColl, maps, err := prepareAnalysis(coll)
+	if err != nil {
+		return fmt.Errorf("failed to prepare programs and maps for system analysis: %v", err)
+	}
+
+	if err := determineSysConfig(systemAnalysisColl, maps, kmod, cfg.IncludeTracers, &rodataVars); err != nil {
+		return fmt.Errorf("failed to determine system configs: %v", err)
+	}
+	if err := coll.Variables["tpbase_offset"].Set(rodataVars.tpbase_offset); err != nil {
+		return fmt.Errorf("failed to set tpbase_offset: %v", err)
+	}
+	if err := coll.Variables["task_stack_offset"].Set(rodataVars.task_stack_offset); err != nil {
+		return fmt.Errorf("failed to set task_stack_offset: %v", err)
+	}
+	if err := coll.Variables["stack_ptregs_offset"].Set(rodataVars.stack_ptregs_offset); err != nil {
+		return fmt.Errorf("failed to set stack_ptregs_offset: %v", err)
+	}
+
+	return nil
 }

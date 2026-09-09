@@ -48,11 +48,11 @@ package perl // import "go.opentelemetry.io/ebpf-profiler/interpreter/perl"
 import (
 	"debug/elf"
 	"regexp"
+	"slices"
 
 	"go.opentelemetry.io/ebpf-profiler/interpreter"
 )
 
-//nolint:golint,stylecheck,revive
 const (
 	// Scalar Value types (SVt)
 	// https://github.com/Perl/perl5/blob/v5.32.0/sv.h#L132-L166
@@ -98,12 +98,10 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		if err != nil {
 			return nil, err
 		}
-		for _, n := range needed {
-			if libperlRegex.MatchString(n) {
-				// 'perl' linked with 'libperl'. The beef is in the library,
-				// so do not try to inspect the shim main binary.
-				return nil, nil
-			}
+		if slices.ContainsFunc(needed, libperlRegex.MatchString) {
+			// 'perl' linked with 'libperl'. The beef is in the library,
+			// so do not try to inspect the shim main binary.
+			return nil, nil
 		}
 	}
 

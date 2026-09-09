@@ -3,48 +3,12 @@
 
 package libpf // import "go.opentelemetry.io/ebpf-profiler/libpf"
 
-import (
-	"encoding/json"
-	"time"
-)
-
-// UnixTime32 is another type to represent seconds since epoch.
-// In most cases 32bit time values are good enough until year 2106.
-// Our time series database backend uses this type for TimeStamps as well,
-// so there is no need to use a different type than uint32.
-// Also, Go's semantics on map[time.Time] are particularly nasty footguns,
-// and since the code is mostly dealing with UNIX timestamps, we may
-// as well use uint32s instead.
-// To restore some semblance of type safety, we declare a type alias here.
-type UnixTime32 uint32
-
-func (t UnixTime32) MarshalJSON() ([]byte, error) {
-	return time.Unix(int64(t), 0).UTC().MarshalJSON()
-}
-
-// Compile-time interface checks
-var _ json.Marshaler = (*UnixTime32)(nil)
-
-// NowAsUInt32 is a convenience function to avoid code repetition
-func NowAsUInt32() uint32 {
-	return uint32(time.Now().Unix())
-}
-
 // UnixTime64 represents nanoseconds since epoch.
 type UnixTime64 uint64
 
 // AddressOrLineno represents a line number in an interpreted file or an offset into
 // a native file.
 type AddressOrLineno uint64
-
-type FrameMetadata struct {
-	FileID         FileID
-	AddressOrLine  AddressOrLineno
-	LineNumber     SourceLineno
-	FunctionOffset uint32
-	FunctionName   string
-	Filename       string
-}
 
 // Void allows to use maps as sets without memory allocation for the values.
 // From the "Go Programming Language":
@@ -61,5 +25,9 @@ type Void struct{}
 // interpreted code.
 type SourceLineno uint64
 
+// SourceColumn represents a column number within a source file line. It is intended to be used
+// for the source column numbers in interpreted code.
+type SourceColumn uint64
+
 // Origin determines the source of a trace.
-type Origin int
+type Origin uint16

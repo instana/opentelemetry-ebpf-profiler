@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 
 	//nolint:gosec
@@ -16,12 +17,13 @@ import (
 	"golang.org/x/sys/unix"
 
 	"go.opentelemetry.io/ebpf-profiler/internal/controller"
-	"go.opentelemetry.io/ebpf-profiler/internal/helpers"
+	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/times"
 	"go.opentelemetry.io/ebpf-profiler/vc"
+	"go.opentelemetry.io/otel/metric/noop"
 
-	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
 )
 
 // Short copyright / license text for eBPF code
@@ -75,7 +77,7 @@ func mainWithExitCode() exitCode {
 	}
 
 	if cfg.VerboseMode {
-		log.SetLevel(log.DebugLevel)
+		log.SetLevel(slog.LevelDebug)
 		// Dump the arguments in debug mode.
 		cfg.Dump()
 	}
@@ -99,40 +101,24 @@ func mainWithExitCode() exitCode {
 		}()
 	}
 
-	intervals := times.New(cfg.MonitorInterval,
-		cfg.ReporterInterval, cfg.ProbabilisticInterval)
+	intervals := times.New(cfg.ReporterInterval,
+		cfg.MonitorInterval, cfg.ProbabilisticInterval)
 
-	kernelVersion, err := helpers.GetKernelVersion()
-	if err != nil {
-		log.Error(err)
-		return exitFailure
-	}
-
-	// hostname and sourceIP will be populated from the root namespace.
-	hostname, sourceIP, err := helpers.GetHostnameAndSourceIP(cfg.CollAgentAddr)
-	if err != nil {
-		log.Error(err)
-		return exitFailure
-	}
-	cfg.HostName, cfg.IPAddress = hostname, sourceIP
+	metrics.Start(noop.Meter{})
 
 	rep, err := reporter.NewOTLP(&reporter.Config{
-		CollAgentAddr:            cfg.CollAgentAddr,
-		DisableTLS:               cfg.DisableTLS,
-		MaxRPCMsgSize:            32 << 20, // 32 MiB
-		MaxGRPCRetries:           5,
-		GRPCOperationTimeout:     intervals.GRPCOperationTimeout(),
-		GRPCStartupBackoffTime:   intervals.GRPCStartupBackoffTime(),
-		GRPCConnectionTimeout:    intervals.GRPCConnectionTimeout(),
-		ReportInterval:           intervals.ReportInterval(),
-		ExecutablesCacheElements: 16384,
-		// Next step: Calculate FramesCacheElements from numCores and samplingRate.
-		FramesCacheElements: 65536,
-		CGroupCacheElements: 1024,
-		SamplesPerSecond:    cfg.SamplesPerSecond,
-		KernelVersion:       kernelVersion,
-		HostName:            hostname,
-		IPAddress:           sourceIP,
+		Name:                   os.Args[0],
+		Version:                vc.Version(),
+		CollAgentAddr:          cfg.CollAgentAddr,
+		DisableTLS:             cfg.DisableTLS,
+		MaxRPCMsgSize:          32 << 20, // 32 MiB
+		MaxGRPCRetries:         5,
+		GRPCOperationTimeout:   intervals.GRPCOperationTimeout(),
+		GRPCStartupBackoffTime: intervals.GRPCStartupBackoffTime(),
+		GRPCConnectionTimeout:  intervals.GRPCConnectionTimeout(),
+		ReportInterval:         intervals.ReportInterval(),
+		ReportJitter:           cfg.ReporterJitter,
+		SamplesPerSecond:       cfg.SamplesPerSecond,
 	})
 	if err != nil {
 		log.Error(err)
@@ -157,7 +143,7 @@ func mainWithExitCode() exitCode {
 	return exitSuccess
 }
 
-func failure(msg string, args ...interface{}) exitCode {
+func failure(msg string, args ...any) exitCode {
 	log.Errorf(msg, args...)
 	return exitFailure
 }

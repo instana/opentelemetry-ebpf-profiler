@@ -5,28 +5,20 @@
 #include "extmaps.h"
 #include "types.h"
 
-// system config is the bpf map containing HA provided system configuration
-bpf_map_def SEC("maps") system_config = {
-  .type        = BPF_MAP_TYPE_ARRAY,
-  .key_size    = sizeof(u32),
-  .value_size  = sizeof(struct SystemConfig),
-  .max_entries = 1,
-};
-
 #ifndef TESTING_COREDUMP
 
 // system_analysis is the bpf map the HA and this module uses to communicate
-bpf_map_def SEC("maps") system_analysis = {
-  .type        = BPF_MAP_TYPE_ARRAY,
-  .key_size    = sizeof(u32),
-  .value_size  = sizeof(struct SystemAnalysis),
-  .max_entries = 1,
-};
+struct system_analysis_t {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __type(key, u32);
+  __type(value, struct SystemAnalysis);
+  __uint(max_entries, 1);
+} system_analysis SEC(".maps");
 
 // read_kernel_memory reads data from given kernel address. This is
 // invoked once on entry to bpf() syscall on the given pid context.
 SEC("tracepoint/syscalls/sys_enter_bpf")
-int read_kernel_memory(void *ctx)
+int read_kernel_memory(UNUSED void *ctx)
 {
   u32 key0 = 0;
 
@@ -41,14 +33,14 @@ int read_kernel_memory(void *ctx)
     return 0;
   }
 
-  // Mark request handled
-  sys->pid = 0;
-
   // Handle the read request
-  if (bpf_probe_read_kernel(sys->code, sizeof(sys->code), (void *)sys->address)) {
-    DEBUG_PRINT("Failed to read code from 0x%lx", (unsigned long)sys->address);
-    return -1;
+  sys->err = bpf_probe_read_kernel(sys->code, sizeof(sys->code), (void *)sys->address);
+  if (sys->err) {
+    DEBUG_PRINT("Failed to read code from 0x%lx: %ld", (unsigned long)sys->address, (long)sys->err);
   }
+
+  // Mark request handled once the helper has finished populating the result.
+  sys->pid = 0;
 
   return 0;
 }
@@ -73,9 +65,6 @@ int read_task_struct(struct bpf_raw_tracepoint_args *ctx)
     return 0;
   }
 
-  // Mark request handled
-  sys->pid = 0;
-
   // Request to read current task. Adjust read address, and return
   // also the address of struct pt_regs in the entry stack.
   u64 addr = bpf_get_current_task() + sys->address;
@@ -86,10 +75,13 @@ int read_task_struct(struct bpf_raw_tracepoint_args *ctx)
   sys->address = (u64)regs;
 
   // Execute the read request.
-  if (bpf_probe_read_kernel(sys->code, sizeof(sys->code), (void *)addr)) {
-    DEBUG_PRINT("Failed to read task_struct from 0x%lx", (unsigned long)addr);
-    return -1;
+  sys->err = bpf_probe_read_kernel(sys->code, sizeof(sys->code), (void *)addr);
+  if (sys->err) {
+    DEBUG_PRINT("Failed to read task_struct from 0x%lx: %ld", (unsigned long)addr, (long)sys->err);
   }
+
+  // Mark request handled once the helper has finished populating the result.
+  sys->pid = 0;
 
   return 0;
 }

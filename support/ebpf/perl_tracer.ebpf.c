@@ -67,27 +67,32 @@
 
 // Map from Perl process IDs to a structure containing addresses of variables
 // we require in order to build the stack trace
-bpf_map_def SEC("maps") perl_procs = {
-  .type        = BPF_MAP_TYPE_HASH,
-  .key_size    = sizeof(pid_t),
-  .value_size  = sizeof(PerlProcInfo),
-  .max_entries = 1024,
-};
+struct perl_procs_t {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, pid_t);
+  __type(value, PerlProcInfo);
+  __uint(max_entries, 1024);
+} perl_procs SEC(".maps");
 
 // Record a Perl frame
-static inline __attribute__((__always_inline__)) ErrorCode
-push_perl(Trace *trace, u64 file, u64 line)
+static EBPF_INLINE ErrorCode push_perl(UnwindState *state, Trace *trace, u64 file, u64 line)
 {
   DEBUG_PRINT("Pushing perl frame cop=0x%lx, cv=0x%lx", (unsigned long)file, (unsigned long)line);
-  return _push(trace, file, line, FRAME_MARKER_PERL);
+
+  u64 *data = push_frame(state, trace, FRAME_MARKER_PERL, FRAME_FLAG_PID_SPECIFIC, 0, 2);
+  if (!data) {
+    return ERR_STACK_LENGTH_EXCEEDED;
+  }
+  data[0] = file;
+  data[1] = line;
+  return ERR_OK;
 }
 
 // resolve_cv_egv() takes in a CV* and follows the pointers to resolve this CV's
 // EGV to be reported for HA. This basically maps the internal code value, to its
 // canonical symbol name. This mapping is done in EBPF because it seems the CV*
 // can get undefined once it goes out of scope, but the EGV should be more permanent.
-static inline __attribute__((__always_inline__)) void *
-resolve_cv_egv(const PerlProcInfo *perlinfo, const void *cv)
+static EBPF_INLINE void *resolve_cv_egv(const PerlProcInfo *perlinfo, const void *cv)
 {
   // First check the CV's type
   u32 cv_flags;
@@ -165,7 +170,7 @@ err:
   return 0;
 }
 
-static inline __attribute__((__always_inline__)) int
+static EBPF_INLINE int
 process_perl_frame(PerCPURecord *record, const PerlProcInfo *perlinfo, const void *cx)
 {
   Trace *trace = &record->trace;
@@ -199,7 +204,7 @@ process_perl_frame(PerCPURecord *record, const PerlProcInfo *perlinfo, const voi
       return unwinder;
     }
 
-    if (get_next_unwinder_after_interpreter(record) != PROG_UNWIND_STOP) {
+    if (get_next_unwinder_after_interpreter() != PROG_UNWIND_STOP) {
       // If generating mixed traces, use 'sub_retop' to detect if this is the
       // C->Perl boundary. This is the value returned as next opcode at
       //   https://github.com/Perl/perl5/blob/v5.32.0/pp_hot.c#L4952-L4955
@@ -211,7 +216,7 @@ process_perl_frame(PerCPURecord *record, const PerlProcInfo *perlinfo, const voi
         goto err;
       }
       if (retop == 0) {
-        unwinder = get_next_unwinder_after_interpreter(record);
+        unwinder = get_next_unwinder_after_interpreter();
       }
     }
 
@@ -225,7 +230,7 @@ process_perl_frame(PerCPURecord *record, const PerlProcInfo *perlinfo, const voi
     if (!egv) {
       goto err;
     }
-    if (push_perl(trace, (u64)egv, (u64)record->perlUnwindState.cop) != ERR_OK) {
+    if (push_perl(&record->state, trace, (u64)egv, (u64)record->perlUnwindState.cop) != ERR_OK) {
       return PROG_UNWIND_STOP;
     }
     record->perlUnwindState.cop = 0;
@@ -259,8 +264,7 @@ err:
   return PROG_UNWIND_PERL;
 }
 
-static inline __attribute__((__always_inline__)) void
-prepare_perl_stack(PerCPURecord *record, const PerlProcInfo *perlinfo)
+static EBPF_INLINE void prepare_perl_stack(PerCPURecord *record, const PerlProcInfo *perlinfo)
 {
   const void *si = record->perlUnwindState.stackinfo;
   // cxstack contains the base of the current context stack which is an array of PERL_CONTEXT
@@ -282,20 +286,18 @@ prepare_perl_stack(PerCPURecord *record, const PerlProcInfo *perlinfo)
   record->perlUnwindState.cxcur  = cxstack + cxix * perlinfo->context_sizeof;
 }
 
-static inline __attribute__((__always_inline__)) int
-walk_perl_stack(PerCPURecord *record, const PerlProcInfo *perlinfo)
+static EBPF_INLINE int walk_perl_stack(PerCPURecord *record, const PerlProcInfo *perlinfo)
 {
   const void *si = record->perlUnwindState.stackinfo;
 
   // If Perl stackinfo is not available, all frames have been processed, then
   // continue with native unwinding.
   if (!si) {
-    return get_next_unwinder_after_interpreter(record);
+    return get_next_unwinder_after_interpreter();
   }
 
   int unwinder       = PROG_UNWIND_PERL;
   const void *cxbase = record->perlUnwindState.cxbase;
-#pragma unroll
   for (u32 i = 0; i < PERL_FRAMES_PER_PROGRAM; ++i) {
     // Test first the stack 'cxcur' validity. Some stacks can have 'cxix=-1'
     // when they are being constructed or ran.
@@ -327,7 +329,7 @@ walk_perl_stack(PerCPURecord *record, const PerlProcInfo *perlinfo)
     u64 cop = (u64)record->perlUnwindState.cop;
     if (cop) {
       DEBUG_PRINT("End of perl stack - pushing main 0x%lx", (unsigned long)cop);
-      if (push_perl(trace, 0, cop) != ERR_OK) {
+      if (push_perl(&record->state, trace, 0, cop) != ERR_OK) {
         return PROG_UNWIND_STOP;
       }
       record->perlUnwindState.cop = 0;
@@ -348,7 +350,7 @@ walk_perl_stack(PerCPURecord *record, const PerlProcInfo *perlinfo)
       record->perlUnwindState.stackinfo = si;
       prepare_perl_stack(record, perlinfo);
     }
-    unwinder = get_next_unwinder_after_interpreter(record);
+    unwinder = get_next_unwinder_after_interpreter();
   }
 
   // Stack completed. Prepare the next one.
@@ -363,7 +365,7 @@ walk_perl_stack(PerCPURecord *record, const PerlProcInfo *perlinfo)
 // unwind_perl is the entry point for tracing when invoked from the native tracer
 // or interpreter dispatcher. It does not reset the trace object and will append the
 // Perl stack frames to the trace object for the current CPU.
-static inline __attribute__((__always_inline__)) int unwind_perl(struct pt_regs *ctx)
+static EBPF_INLINE int unwind_perl(struct pt_regs *ctx)
 {
   PerCPURecord *record = get_per_cpu_record();
   if (!record) {
@@ -372,15 +374,15 @@ static inline __attribute__((__always_inline__)) int unwind_perl(struct pt_regs 
 
   Trace *trace = &record->trace;
   u32 pid      = trace->pid;
+  int unwinder = get_next_unwinder_after_interpreter();
   DEBUG_PRINT("unwind_perl()");
 
   PerlProcInfo *perlinfo = bpf_map_lookup_elem(&perl_procs, &pid);
   if (!perlinfo) {
     DEBUG_PRINT("Can't build Perl stack, no address info");
-    return 0;
+    goto exit;
   }
 
-  int unwinder = get_next_unwinder_after_interpreter(record);
   DEBUG_PRINT("Building Perl stack for 0x%x", perlinfo->version);
 
   if (!record->perlUnwindState.stackinfo) {

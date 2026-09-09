@@ -6,25 +6,21 @@ package php // import "go.opentelemetry.io/ebpf-profiler/interpreter/php"
 import (
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"sync/atomic"
 
-	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
 
 	"github.com/elastic/go-freelru"
 
-	"go.opentelemetry.io/ebpf-profiler/host"
 	"go.opentelemetry.io/ebpf-profiler/interpreter"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	npsr "go.opentelemetry.io/ebpf-profiler/nopanicslicereader"
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
-	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/successfailurecounter"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
-//nolint:golint,stylecheck,revive
 const (
 	// zend_function.type definitions from PHP sources
 	ZEND_USER_FUNCTION = (1 << 1)
@@ -40,13 +36,10 @@ const (
 // PHP interpreter's zend_function structure.
 type phpFunction struct {
 	// name is the extracted name
-	name string
+	name libpf.String
 
 	// sourceFileName is the extracted filename field
-	sourceFileName string
-
-	// fileID is the synthesized methodID
-	fileID libpf.FileID
+	sourceFileName libpf.String
 
 	// lineStart is the first source code line for this function
 	lineStart uint32
@@ -123,26 +116,45 @@ func (i *phpInstance) getFunction(addr libpf.Address, typeInfo uint32) (*phpFunc
 	}
 
 	// Parse the zend_function structure
-	ftype := npsr.Uint8(fobj, vms.zend_function.common_type)
-	fname := i.rm.String(npsr.Ptr(fobj, vms.zend_function.common_funcname) + vms.zend_string.val)
+	ftype := npsr.Uint8(fobj, uint(vms.zend_function.common_type))
+	fname := i.rm.String(npsr.Ptr(fobj, uint(vms.zend_function.common_funcname)) +
+		vms.zend_string.val)
 
 	if fname != "" && !util.IsValidString(fname) {
 		log.Debugf("Extracted invalid PHP function name at 0x%x '%v'", addr, []byte(fname))
 		fname = ""
 	}
 
-	if fname == "" {
+	// Read the class name from common.scope (zend_class_entry pointer).
+	// If the function is a method, scope points to the declaring class.
+	scopePtr := npsr.Ptr(fobj, vms.zend_function.common_scope)
+	if scopePtr != 0 {
+		classNameStrPtr := i.rm.Ptr(scopePtr + libpf.Address(vms.zend_class_entry.name))
+		if classNameStrPtr != 0 {
+			className := i.rm.String(classNameStrPtr + vms.zend_string.val)
+			if className != "" && !util.IsValidString(className) {
+				log.Debugf("Extracted invalid PHP class name at 0x%x", addr)
+				className = ""
+			}
+			// Combine class name and function name using PHP's ClassName::methodName convention.
+			if className != "" && fname != "" {
+				fname = className + "::" + fname
+			}
+		}
+	}
+
+	functionName := libpf.Intern(fname)
+	if functionName == libpf.NullString {
 		// If we're at the top-most scope then we can display that information.
 		if typeInfo&ZEND_CALL_TOP_CODE > 0 {
-			fname = interpreter.TopLevelFunctionName
+			functionName = interpreter.TopLevelFunctionName
 		} else {
-			fname = unknownFunctionName
+			functionName = interpreter.UnknownFunctionName
 		}
 	}
 
 	sourceFileName := ""
 	lineStart := uint32(0)
-	var lineBytes []byte
 	switch ftype {
 	case ZEND_USER_FUNCTION, ZEND_EVAL_CODE:
 		sourceAddr := npsr.Ptr(fobj, vms.zend_function.op_array_filename)
@@ -154,7 +166,7 @@ func (i *phpInstance) getFunction(addr libpf.Address, typeInfo uint32) (*phpFunc
 		}
 
 		if ftype == ZEND_EVAL_CODE {
-			fname = evalCodeFunctionName
+			functionName = evalCodeFunctionName
 			// To avoid duplication we get rid of the filename
 			// It'll look something like "eval'd code", so no
 			// information is lost here.
@@ -162,47 +174,33 @@ func (i *phpInstance) getFunction(addr libpf.Address, typeInfo uint32) (*phpFunc
 		}
 
 		lineStart = npsr.Uint32(fobj, vms.zend_function.op_array_linestart)
-		//nolint:lll
-		lineBytes = fobj[vms.zend_function.op_array_linestart : vms.zend_function.op_array_linestart+8]
-	}
-
-	// The fnv hash Write() method calls cannot fail, so it's safe to ignore the errors.
-	h := fnv.New128a()
-	_, _ = h.Write([]byte(sourceFileName))
-	_, _ = h.Write([]byte(fname))
-	_, _ = h.Write(lineBytes)
-	fileID, err := libpf.FileIDFromBytes(h.Sum(nil))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create a file ID: %v", err)
 	}
 
 	pf := &phpFunction{
-		name:           fname,
-		sourceFileName: sourceFileName,
-		fileID:         fileID,
+		name:           functionName,
+		sourceFileName: libpf.Intern(sourceFileName),
 		lineStart:      lineStart,
 	}
 	i.addrToFunction.Add(addr, pf)
 	return pf, nil
 }
 
-func (i *phpInstance) Symbolize(symbolReporter reporter.SymbolReporter,
-	frame *host.Frame, trace *libpf.Trace) error {
+func (i *phpInstance) Symbolize(ef libpf.EbpfFrame, frames *libpf.Frames, _ libpf.FrameMapping) error {
 	// With Symbolize() in opcacheInstance there is a dedicated function to symbolize JITTed
 	// PHP frames. But as we also attach phpInstance to PHP processes with JITTed frames, we
 	// use this function to symbolize all PHP frames, as the process to do so is the same.
-	if !frame.Type.IsInterpType(libpf.PHP) &&
-		!frame.Type.IsInterpType(libpf.PHPJIT) {
+	if !ef.Type().IsInterpType(libpf.PHP) &&
+		!ef.Type().IsInterpType(libpf.PHPJIT) {
 		return interpreter.ErrMismatchInterpreterType
 	}
 
 	sfCounter := successfailurecounter.New(&i.successCount, &i.failCount)
 	defer sfCounter.DefaultToFailure()
 
-	funcPtr := libpf.Address(frame.File)
+	funcPtr := libpf.Address(ef.Variable(0))
 	// We pack type info and the line number into linenos
-	typeInfo := uint32(frame.Lineno >> 32)
-	line := frame.Lineno & 0xffffffff
+	typeInfo := uint32(ef.Variable(1) >> 32)
+	line := uint32(ef.Variable(1))
 
 	f, err := i.getFunction(funcPtr, typeInfo)
 	if err != nil {
@@ -210,13 +208,12 @@ func (i *phpInstance) Symbolize(symbolReporter reporter.SymbolReporter,
 	}
 
 	funcOff := uint32(0)
-	if f.lineStart != 0 && libpf.AddressOrLineno(f.lineStart) <= line {
-		funcOff = uint32(line) - f.lineStart
+	if f.lineStart != 0 && f.lineStart <= line {
+		funcOff = line - f.lineStart
 	}
-	frameID := libpf.NewFrameID(f.fileID, line)
-	trace.AppendFrameID(libpf.PHPFrame, frameID)
-	symbolReporter.FrameMetadata(&reporter.FrameMetadataArgs{
-		FrameID:        frameID,
+
+	frames.Append(&libpf.Frame{
+		Type:           libpf.PHPFrame,
 		FunctionName:   f.name,
 		SourceFile:     f.sourceFileName,
 		SourceLine:     libpf.SourceLineno(line),

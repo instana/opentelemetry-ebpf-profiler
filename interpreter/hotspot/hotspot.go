@@ -73,6 +73,14 @@ package hotspot // import "go.opentelemetry.io/ebpf-profiler/interpreter/hotspot
 //  JDK21 - Tested ok
 //   - JDK_Version removed from introspection data
 //  JDK22 - Tested ok
+//   - nmethod scopes etc. immutable data split to separate data area
+//  JDK23 - Tested ok
+//  JDK24 - Tested ok
+//   - nmethod metadata moved to codeblob mutable data area
+//  JDK25 - Tested ok
+//  JDK26 - Tested ok
+//   - nmethod._deopt_handler_offset renamed to _deopt_handler_entry_offset
+//   - immutable_data now has ref count trailer (_immutable_data_ref_count_offset)
 //
 // NOTE: Ahead-Of-Time compilation (AOT) is NOT SUPPORTED. The main complication is that, the AOT
 // ELF files are mapped directly to the program virtual space, and contain the code to execute.
@@ -108,10 +116,9 @@ package hotspot // import "go.opentelemetry.io/ebpf-profiler/interpreter/hotspot
 import (
 	"regexp"
 
-	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
 
 	"go.opentelemetry.io/ebpf-profiler/interpreter"
-	"go.opentelemetry.io/ebpf-profiler/libpf"
 )
 
 var (
@@ -121,9 +128,6 @@ var (
 	// Match Java Hidden Class identifier and the replacement string
 	hiddenClassRegex = regexp.MustCompile(`\+0x[0-9a-f]{16}`)
 	hiddenClassMask  = "+<hidden>"
-
-	// The FileID used for intrinsic stub frames
-	hotspotStubsFileID = libpf.NewFileID(0x578b, 0x1d)
 
 	_ interpreter.Data     = &hotspotData{}
 	_ interpreter.Instance = &hotspotInstance{}

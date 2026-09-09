@@ -8,10 +8,10 @@
 
 // ID values used as index to maps/metrics array.
 // If you add enums below please update the following places too:
-//  - The host agent ebpf metricID to DB IDMetric translation table in:
-//    tracer/tracer.go/(StartMapMonitors).
-//  - The ebpf userland test code metricID stringification table in:
-//    support/ebpf/tests/tostring.c
+//  - The actual metric knob in:
+//    metrics/metrics.json
+//  - The mapping of this enum to the metric in Go:
+//    support/types_def.go
 enum {
   // number of calls to interpreter unwinding in get_next_interpreter()
   metricID_UnwindCallInterpreter = 0,
@@ -250,10 +250,10 @@ enum {
   // number of failures to read the instruction sequence body
   metricID_UnwindRubyErrReadIseqBody,
 
-  // number of failures to read the instruction sequence encoded size
+  // number of failures to read the instruction sequence encoded size (deprecated)
   metricID_UnwindRubyErrReadIseqEncoded,
 
-  // number of failures to read the instruction sequence size
+  // number of failures to read the instruction sequence size (deprecated)
   metricID_UnwindRubyErrReadIseqSize,
 
   // number of times the unwind instructions requested LR unwinding mid-trace
@@ -301,6 +301,36 @@ enum {
   // number of failures to unwind code object due to its large size
   metricID_UnwindDotnetErrCodeTooLarge,
 
+  // number of attempts to read Go custom labels
+  metricID_UnwindGoLabelsAttempts,
+
+  // number of failures to read Go custom labels
+  metricID_UnwindGoLabelsFailures,
+
+  // number of invalid instruction sequences sequence
+  metricID_UnwindRubyErrInvalidIseq,
+
+  // number of failures to read the Ruby method definition
+  metricID_UnwindRubyErrReadMethodDef,
+
+  // number of failures to read the Ruby method type
+  metricID_UnwindRubyErrReadMethodType,
+
+  // number of failures to read the Ruby svar while finding CME
+  metricID_UnwindRubyErrReadSvar,
+
+  // number of failures to read the Ruby rbasic flags
+  metricID_UnwindRubyErrReadRbasicFlags,
+
+  // number of failed attempts to read a CME by exceeding max EP checks
+  metricID_UnwindRubyErrCmeMaxEp,
+
+  // number of failures to read TLS variables via the DTV
+  metricID_UnwindErrBadDTVRead,
+
+  // number of bpf_ringbuf_output failures
+  metricID_BPFRingbufOutputErr,
+
   //
   // Metric IDs above are for counters (cumulative values)
   //
@@ -328,6 +358,10 @@ typedef enum TracePrograms {
   PROG_UNWIND_RUBY,
   PROG_UNWIND_V8,
   PROG_UNWIND_DOTNET,
+  PROG_UNWIND_DOTNET10,
+  PROG_GO_LABELS,
+  PROG_UNWIND_BEAM,
+  PROG_UNWIND_LUAJIT,
   NUM_TRACER_PROGS,
 } TracePrograms;
 
@@ -337,54 +371,42 @@ typedef enum TraceOrigin {
   TRACE_UNKNOWN,
   TRACE_SAMPLING,
   TRACE_OFF_CPU,
+  TRACE_PROBE,
 } TraceOrigin;
 
-// OFF_CPU_THRESHOLD_MAX defines the maximum threshold.
-#define OFF_CPU_THRESHOLD_MAX 1000
-
-// MAX_FRAME_UNWINDS defines the maximum number of frames per
-// Trace we can unwind and respect the limit of eBPF instructions,
-// limit of tail calls and limit of stack size per eBPF program.
-#define MAX_FRAME_UNWINDS 128
-
-// MAX_NON_ERROR_FRAME_UNWINDS defines the maximum number of frames
-// to be pushed by unwinders while still leaving space for an error frame.
-// This is used to make sure that there is always space for an error
-// frame reporting that we ran out of stack space.
-#define MAX_NON_ERROR_FRAME_UNWINDS (MAX_FRAME_UNWINDS - 1)
-
-// Type to represent a globally-unique file id to be used as key for a BPF hash map
-typedef u64 FileID;
-
-// Individual frame in a stack-trace.
-typedef struct Frame {
-  // IDs that uniquely identify a file combination
-  FileID file_id;
-  // For PHP this is the line numbers, corresponding to the files in `stack`.
-  // For Python, each value provides information to allow for the recovery of
-  // the line number associated with its corresponding offset in `stack`.
-  // The lower 32 bits provide the co_firstlineno value and the upper 32 bits
-  // provide the f_lasti value. Other interpreter handlers use the field in
-  // a similarly domain-specific fashion.
-  u64 addr_or_line;
-  // Indicates the type of the frame (Python, PHP, native etc.).
-  u8 kind;
-  // Indicates that the address is a return address.
-  u8 return_address;
-  // Explicit padding bytes that the compiler would have inserted anyway.
-  // Here to make it clear to readers that there are spare bytes that could
-  // be put to work without extra cost in case an interpreter needs it.
-  u8 pad[6];
-} Frame;
-
-_Static_assert(sizeof(Frame) == 3 * 8, "frame padding not working as expected");
+// Maximum number of unique stack deltas needed on a system. This is based on
+// normal desktop /usr/bin/* and /usr/lib/*.so having about 9700 unique deltas.
+// Can be increased up to 2^15, see also STACK_DELTA_COMMAND_FLAG.
+#define UNWIND_INFO_MAX_ENTRIES 16384
 
 // TSDInfo contains data needed to extract Thread Specific Data (TSD) values
 typedef struct TSDInfo {
+  // Offset is the pointer difference from "tpbase" pointer to the C-library
+  // specific struct pthread's member containing the thread specific data:
+  // .tsd (musl) or .specific (glibc).
+  // Note: on x86_64 it's positive value, and arm64 it is negative value as
+  // "tpbase" register has different purpose and pointer value per platform ABI.
   s16 offset;
+  // Multiplier is the TSD specific value array element size.
+  // Typically 8 bytes on 64bit musl and 16 bytes on 64bit glibc
   u8 multiplier;
+  // Indirect is a flag indicating if the "tpbase + Offset" points to a member
+  // which is a pointer the array (musl) and not the array itself (glibc).
   u8 indirect;
 } TSDInfo;
+
+// DTVInfo contains data needed to read Thread Local Storage (TLS) values, which
+// are located using the Dynamic Thread Vector (DTV).
+// DTV access is always indirect: TP+offset yields a pointer to the DTV array,
+// which must be dereferenced before indexing by module ID. This is true for
+// both glibc and musl (the DTV is a separately-allocated array, not inline
+// in the thread control block).
+typedef struct DTVInfo {
+  // Offset is the offset of the DTV pointer from the thread pointer base.
+  s16 offset;
+  // Multiplier is the size of each DTV entry in bytes.
+  u8 multiplier;
+} DTVInfo;
 
 // DotnetProcInfo is a container for the data needed to build stack trace for a dotnet process.
 typedef struct DotnetProcInfo {
@@ -407,7 +429,9 @@ typedef struct PerlProcInfo {
 typedef struct PyProcInfo {
   // The address of the autoTLSkey variable
   u64 autoTLSKeyAddr;
+  u64 noneStructAddr;
   u16 version;
+  s16 tls_offset;
   TSDInfo tsdInfo;
   // The Python object member offsets
   u8 PyThreadState_frame;
@@ -417,6 +441,7 @@ typedef struct PyProcInfo {
   u8 PyCodeObject_co_argcount, PyCodeObject_co_kwonlyargcount;
   u8 PyCodeObject_co_flags, PyCodeObject_co_firstlineno;
   u8 PyCodeObject_sizeof;
+  u8 lasti_is_codeunit, frame_is_cframe;
 } PyProcInfo;
 
 // PHPProcInfo is a container for the data needed to build a stack trace for a PHP process.
@@ -443,7 +468,7 @@ typedef struct HotspotProcInfo {
   u8 codeblob_codestart, codeblob_codeend;
   u8 codeblob_framecomplete, codeblob_framesize;
   u8 heapblock_size, method_constmethod, cmethod_size;
-  u8 jvm_version, segment_shift, nmethod_uses_offsets;
+  u8 jvm_version, new_bcp_slot, segment_shift, nmethod_uses_offsets;
 } HotspotProcInfo;
 
 // RubyProcInfo is a container for the data needed to build a stack trace for a Ruby process.
@@ -451,13 +476,35 @@ typedef struct RubyProcInfo {
   // version of the Ruby interpreter.
   u32 version;
 
+  // tls_offset holds TLS base + ruby_current_ec tls symbol, as an offset from tpbase.
+  // Signed because static TLS offsets (local exec model) are negative on x86_64.
+  s64 current_ec_tpbase_tls_offset;
+
+  // DTV-based TLS access for ruby_current_ec (fallback when TLSDESC unavailable)
+  DTVInfo dtv_info;
+  // Offset of ruby_current_ec within its module's TLS block
+  u64 current_ec_tls_offset;
+  // Runtime TLS module ID for libruby.so (from DTPMOD64 relocation, written by linker)
+  u32 tls_module_id;
+
   // current_ctx_ptr holds the address of the symbol ruby_current_execution_context_ptr.
   u64 current_ctx_ptr;
 
+  // is reading gc state from objspace supported for this version?
+  bool has_objspace;
   // Offsets and sizes of Ruby internal structs
 
   // rb_execution_context_struct offsets:
-  u8 vm_stack, vm_stack_size, cfp;
+  u8 vm_stack, vm_stack_size, cfp, thread_ptr;
+
+  // rb_thread_struct offsets
+  u8 thread_vm;
+
+  // rb_vm_struct offsets
+  u16 vm_objspace;
+
+  // rb_objspace offsets
+  u8 objspace_flags, objspace_size_of_flags;
 
   // rb_control_frame_struct offsets:
   u8 pc, iseq, ep, size_of_control_frame_struct;
@@ -465,8 +512,8 @@ typedef struct RubyProcInfo {
   // rb_iseq_struct offsets:
   u8 body;
 
-  // rb_iseq_constant_body:
-  u8 iseq_type, iseq_encoded, iseq_size;
+  // rb_callable_method_entry_struct
+  u8 cme_method_def;
 
   // size_of_value holds the size of the macro VALUE as defined in
   // https://github.com/ruby/ruby/blob/5445e0435260b449decf2ac16f9d09bae3cafe72/vm_core.h#L1136
@@ -483,10 +530,22 @@ typedef struct V8ProcInfo {
   // Introspection data
   u16 type_JSFunction_first, type_JSFunction_last, type_Code, type_SharedFunctionInfo;
   u8 off_HeapObject_map, off_Map_instancetype, off_JSFunction_code, off_JSFunction_shared;
+  u8 code_instructions_is_pointer;
   u8 off_Code_instruction_start, off_Code_instruction_size, off_Code_flags;
   u8 fp_marker, fp_function, fp_bytecode_offset;
   u8 codekind_shift, codekind_mask, codekind_baseline;
 } V8ProcInfo;
+
+// BEAMProcInfo is a container for the data needed to build a stack trace for a BEAM process.
+typedef struct BEAMProcInfo {
+  u64 bias;
+  u64 r;
+  u64 the_active_code_index;
+  u64 beam_normal_exit;
+  bool frame_pointers_enabled;
+  // Introspection Struct Offsets
+  u8 ranges_sizeof;
+} BEAMProcInfo;
 
 // COMM_LEN defines the maximum length we will receive for the comm of a task.
 #define COMM_LEN 16
@@ -510,6 +569,11 @@ typedef union ApmSpanID {
 
 _Static_assert(sizeof(ApmSpanID) == 8, "unexpected trace ID size");
 
+typedef struct __attribute__((packed)) SpanTraceInfo {
+  ApmTraceID trace_id;
+  ApmSpanID span_id;
+} SpanTraceInfo;
+
 // Defines the format of the APM correlation TLS buffer.
 //
 // Specification:
@@ -524,6 +588,22 @@ typedef struct __attribute__((packed)) ApmCorrelationBuf {
   ApmSpanID transaction_id;
 } ApmCorrelationBuf;
 
+#define CUSTOM_LABEL_MAX_KEY_LEN COMM_LEN
+// Big enough to hold UUIDs, etc.
+#define CUSTOM_LABEL_MAX_VAL_LEN 48
+
+typedef struct CustomLabel {
+  u8 key[CUSTOM_LABEL_MAX_KEY_LEN];
+  u8 val[CUSTOM_LABEL_MAX_VAL_LEN];
+} CustomLabel;
+
+#define MAX_CUSTOM_LABELS 10
+
+typedef struct CustomLabelsArray {
+  unsigned len;
+  CustomLabel labels[MAX_CUSTOM_LABELS];
+} CustomLabelsArray;
+
 // Container for a stack trace
 typedef struct Trace {
   // The process ID
@@ -535,46 +615,63 @@ typedef struct Trace {
   // Monotonic kernel time in nanosecond precision.
   u64 ktime;
   // The current COMM of the thread of this Trace.
-  char comm[COMM_LEN];
+  u8 comm[COMM_LEN];
   // APM transaction ID or all-zero if not present.
   ApmSpanID apm_transaction_id;
   // APM trace ID or all-zero if not present.
   ApmTraceID apm_trace_id;
-  // The kernel stack ID.
-  s32 kernel_stack_id;
-  // The number of frames in the stack.
-  u32 stack_len;
+  // Custom Labels
+  CustomLabelsArray custom_labels;
+  // The number of frame_data elements present.
+  u16 frame_data_len;
+  // The number of frames present.
+  u16 num_frames;
+  // The number of kernel stack frames at the start of frame_data.
+  // These are raw u64 addresses from bpf_get_stack(), not encoded frames.
+  u16 num_kernel_frames;
 
   // origin indicates the source of the trace.
   TraceOrigin origin;
 
-  // offtime stores the nanoseconds that the trace was off-cpu for.
-  u64 offtime;
+  // value stores context-specific data that was collected with the stack.
+  // e.g. time in nanoseconds for off-CPU traces
+  u64 value;
 
-  // The frames of the stack trace.
-  Frame frames[MAX_FRAME_UNWINDS];
+  // The CPU that captured this trace.
+  u32 cpu_id;
 
-  // NOTE: both send_trace in BPF and loadBpfTrace in UM code require `frames`
-  // to be the last item in the struct. Do not add new members here without also
-  // adjusting the UM code.
+  // The frame data of the stack trace. Each frame is variable length.
+  // Frame is currently 2-3 entries long. This array size limits the
+  // number of frames we can unwind, but also increases the memory
+  // needed for buffering everything. The 3kB entries here is chosen
+  // to allow about 1024 frames in a trace to be sent.
+  u64 frame_data[3072];
+
+  // NOTE: both send_trace in BPF and loadBpfTrace in UM code require `frame_data`
+  // to be the last item in the struct. When sending via the ringbuffer, only the
+  // 'frame_data_len' elements of 'frame_data' are sent.
 } Trace;
 
 // Container for unwinding state
 typedef struct UnwindState {
-  // Current register value for Program Counter
-  u64 pc;
-  // Current register value for Stack Pointer
-  u64 sp;
-  // Current register value for Frame Pointer
-  u64 fp;
-
+  // CPU register state
+  union {
+    // regs is for the native unwinder to index the registers
+    // indexed by #define UNWIND_REG_*
+    u64 regs[16];
+    // The anonymous struct offers readable code access to the array.
+    // The defined UNWIND_REG_* indexes must match the below names.
+    struct {
+      u64 inval, cfa, pc, sp, fp, lr;
+      // The per-CPU registers which are not unwound, but needed to be accessed
+      // on leaf frames.
 #if defined(__x86_64__)
-  // Current register values for named registers
-  u64 rax, r9, r11, r13, r15;
+      u64 rax, rdi, r8, r9, r11, r13, r15;
 #elif defined(__aarch64__)
-  // Current register values for named registers
-  u64 lr, r22;
+      u64 r20, r22, r28;
 #endif
+    };
+  };
 
   // The executable ID/hash associated with PC
   u64 text_section_id;
@@ -638,6 +735,8 @@ typedef struct RubyUnwindState {
   void *stack_ptr;
   // Pointer to the last control frame struct in the Ruby VM stack we want to handle.
   void *last_stack_frame;
+  // Frame for last cfunc before we switched to native unwinder
+  u64 cfunc_saved_frame;
 } RubyUnwindState;
 
 // Container for additional scratch space needed by the HotSpot unwinder.
@@ -647,7 +746,10 @@ typedef struct DotnetUnwindScratchSpace {
   // can recognize: 256 bytes/element * 128 elements = 32kB function size.
   // Multiplied by two for extra space to read to this array a fixed amount of bytes
   // to a dynamic offset.
-  u32 map[2 * 128];
+  union {
+    u32 map[2 * 128];
+    u64 map64[128];
+  };
 } DotnetUnwindScratchSpace;
 
 // Container for additional scratch space needed by the HotSpot unwinder.
@@ -681,6 +783,31 @@ typedef struct PythonUnwindScratchSpace {
   u8 code[192];
 } PythonUnwindScratchSpace;
 
+// https://github.com/golang/go/blob/6885bad7dd/src/cmd/compile/internal/types/size.go#L28
+struct GoString {
+  char *str;
+  u64 len;
+};
+
+// https://github.com/golang/go/blob/6885bad7dd/src/cmd/compile/internal/types/size.go#L20
+struct GoSlice {
+  void *array;
+  u64 len;
+  s64 cap;
+};
+
+// https://github.com/golang/go/blob/6885bad7dd/src/runtime/map.go#L109
+typedef struct GoMapBucket {
+  char tophash[8];
+  struct GoString keys[8];
+  struct GoString values[8];
+  void *overflow;
+} GoMapBucket;
+
+typedef struct CustomLabelsState {
+  void *go_m_ptr;
+} CustomLabelsState;
+
 // Per-CPU info for the stack being built. This contains the stack as well as
 // meta-data on the number of eBPF tail-calls used so far to construct it.
 typedef struct PerCPURecord {
@@ -696,6 +823,8 @@ typedef struct PerCPURecord {
   PHPUnwindState phpUnwindState;
   // The current Ruby unwinder state.
   RubyUnwindState rubyUnwindState;
+  // State for Go and Native custom labels
+  CustomLabelsState customLabelsState;
   union {
     // Scratch space for the Dotnet unwinder.
     DotnetUnwindScratchSpace dotnetUnwindScratch;
@@ -705,6 +834,17 @@ typedef struct PerCPURecord {
     V8UnwindScratchSpace v8UnwindScratch;
     // Scratch space for the Python unwinder
     PythonUnwindScratchSpace pythonUnwindScratch;
+    // Go labels scratch
+    GoMapBucket goMapBucket;
+    // Scratch for Go 1.24 labels
+    struct GoString labels[MAX_CUSTOM_LABELS * 2];
+    // Signal frame registers for unwind_one_frame (avoids 272-byte stack alloc on arm64).
+    // Sized to match the kernel rt_sigframe register array for the target architecture.
+#if defined(__x86_64__)
+    u64 rt_regs[18];
+#elif defined(__aarch64__)
+    u64 rt_regs[34];
+#endif
   };
   // Mask to indicate which unwinders are complete
   u32 unwindersDone;
@@ -716,15 +856,56 @@ typedef struct PerCPURecord {
   u8 ratelimitAction;
 } PerCPURecord;
 
+// https://github.com/torvalds/linux/blob/e9a6fb0bcdd7609be6969112f3fbfcce3b1d4a7c/include/linux/percpu.h#L24C39-L24C47
+_Static_assert(sizeof(struct PerCPURecord) <= (32 << 10), "Per CPU record too large");
+
 // UnwindInfo contains the unwind information needed to unwind one frame
 // from a specific address.
 typedef struct UnwindInfo {
-  u8 opcode;      // main opcode to unwind CFA
-  u8 fpOpcode;    // opcode to unwind FP
+  u8 flags;       // flags: UNWIND_FLAG_*
+  u8 baseReg;     // base register to calculate CFA from
+  u8 auxBaseReg;  // base register to calculate FP (x86-64) or RA[+FP] (aarch64)
   u8 mergeOpcode; // opcode for generating next stack delta, see below
   s32 param;      // parameter for the CFA expression
-  s32 fpParam;    // parameter for the FP expression
+  s32 auxParam;   // parameter for the FP expression
 } UnwindInfo;
+
+// UNWIND_REF_* values are used for 'baseReg' and auxBaseReg'.
+// This must be in sync with the registers struct in struct UnwindState.
+#define UNWIND_REG_INVALID 0
+#define UNWIND_REG_CFA     1
+#define UNWIND_REG_PC      2
+#define UNWIND_REG_SP      3
+#define UNWIND_REG_FP      4
+#define UNWIND_REG_LR      5
+
+#define UNWIND_REG_X86_RAX 6
+#define UNWIND_REG_X86_RDI 7
+#define UNWIND_REG_X86_R8  8
+#define UNWIND_REG_X86_R9  9
+#define UNWIND_REG_X86_R11 10
+#define UNWIND_REG_X86_R13 11
+#define UNWIND_REG_X86_R15 12
+
+// Flag to indicate a command (used inside Go stack delta generation only)
+#define UNWIND_FLAG_COMMAND     (1 << 0)
+// Flag to indicate that a full LR+FR frame is present on aarch64
+#define UNWIND_FLAG_FRAME       (1 << 1)
+// Flag to indicate that unwinding is valid on leaf frames only (uses untracked register)
+#define UNWIND_FLAG_LEAF_ONLY   (1 << 2)
+// Flag to indicate that the resolve CFA value should be dereferenced
+#define UNWIND_FLAG_DEREF_CFA   (1 << 3)
+// Flag to indicate that the return address is in a register
+#define UNWIND_FLAG_REGISTER_RA (1 << 4)
+
+// If flags has UNWIND_FLAG_DEREF_CFA set, the lowest bits of 'param' are used
+// as second adder as post-deref operation. This contains the mask for that.
+// This assumes that stack and CFA are aligned to register size, so that the
+// lowest bits of the offsets are always unset.
+#define UNWIND_DEREF_MASK       7
+// The argument after dereference is multiplied by this to allow some range.
+// This assumes register size offsets are used.
+#define UNWIND_DEREF_MULTIPLIER 8
 
 // The 8-bit mergeOpcode consists of two separate fields:
 //  1 bit   the adjustment to 'param' is negative (-8), if not set positive (+8)
@@ -739,12 +920,19 @@ typedef struct StackDelta {
 } StackDelta;
 
 // unwindInfo flag indicating that the value is UNWIND_COMMAND_* value and not an index to
-// the unwind info array. When UnwindInfo.opcode is UNWIND_OPCODE_COMMAND the 'param' gives
-// the UNWIND_COMMAND_* which describes the exact handling for this stack delta (all
-// CFA/PC/FP recovery, or stop condition), and the eBPF code needs special code to handle it.
-// This basically serves as a minor optimization to not take a slot from unwind info array,
-// nor require a table lookup for these special cased stack deltas.
+// the unwind info array.
 #define STACK_DELTA_COMMAND_FLAG 0x8000
+
+// Unsupported or no value for the register
+#define UNWIND_COMMAND_INVALID       0
+// For CFA: stop unwinding, this function is a stack root function
+#define UNWIND_COMMAND_STOP          1
+// Unwind a PLT entry
+#define UNWIND_COMMAND_PLT           2
+// Unwind a signal frame
+#define UNWIND_COMMAND_SIGNAL        3
+// Unwind using standard frame pointer
+#define UNWIND_COMMAND_FRAME_POINTER 4
 
 // StackDeltaPageKey is the look up key for stack delta page map.
 typedef struct StackDeltaPageKey {
@@ -773,8 +961,14 @@ typedef struct StackDeltaPageInfo {
 // the upper boundary of the loop, and the relevant index to call in the prog
 // array.
 typedef struct OffsetRange {
-  u64 lower_offset;
-  u64 upper_offset;
+  u64 lower_offset1;
+  u64 upper_offset1;
+  // Fields {lower,upper}_offset2 may be used to specify an optional second range
+  // of an interpreter function. This may be useful if the interpreter function
+  // consists of two non-contiguous memory ranges, which may happen due to Hot/Cold
+  // split compiler optimization
+  u64 lower_offset2;
+  u64 upper_offset2;
   u16 program_index; // The interpreter-specific program index to call.
 } OffsetRange;
 
@@ -782,6 +976,7 @@ typedef struct OffsetRange {
 typedef struct SystemAnalysis {
   u64 address;
   u32 pid;
+  s32 err;
   u8 code[128];
 } SystemAnalysis;
 
@@ -833,49 +1028,10 @@ typedef struct PIDPageMappingInfo {
 // FUNC_TYPE_UNKNOWN indicates an unknown interpreted function.
 #define FUNC_TYPE_UNKNOWN 0xfffffffffffffffe
 
-// Builds a bias_and_unwind_program value for PIDPageMappingInfo
-static inline __attribute__((__always_inline__)) u64
-encode_bias_and_unwind_program(u64 bias, int unwind_program)
-{
-  return bias | (((u64)unwind_program) << 56);
-}
-
-// Reads a bias_and_unwind_program value from PIDPageMappingInfo
-static inline __attribute__((__always_inline__)) void
-decode_bias_and_unwind_program(u64 bias_and_unwind_program, u64 *bias, int *unwind_program)
-{
-  *bias           = bias_and_unwind_program & 0x00FFFFFFFFFFFFFF;
-  *unwind_program = bias_and_unwind_program >> 56;
-}
-
 // Smallest stack delta bucket that holds up to 2^8 entries
 #define STACK_DELTA_BUCKET_SMALLEST 8
 // Largest stack delta bucket that holds up to 2^23 entries
 #define STACK_DELTA_BUCKET_LARGEST  23
-
-// Struct of the `system_config` map. Contains various configuration variables
-// determined and set by the host agent.
-typedef struct SystemConfig {
-  // PAC mask that is determined by user-space and used in `normalize_pac_ptr`.
-  // ARM64 specific, `MAX_U64` otherwise.
-  u64 inverse_pac_mask;
-
-  // The offset of the Thread Pointer Base variable in `task_struct`. It is
-  // populated by the host agent based on kernel code analysis.
-  u64 tpbase_offset;
-
-  // The offset of stack base within `task_struct`.
-  u32 task_stack_offset;
-
-  // The offset of struct pt_regs within the kernel entry stack.
-  u32 stack_ptregs_offset;
-
-  // User defined threshold for off-cpu profiling.
-  u32 off_cpu_threshold;
-
-  // Enables the temporary hack that drops pure errors frames in unwind_stop.
-  bool drop_error_only_traces;
-} SystemConfig;
 
 // Avoid including all of arch/arm64/include/uapi/asm/ptrace.h by copying the
 // actually used values.
@@ -887,4 +1043,14 @@ typedef struct ApmIntProcInfo {
   u64 tls_offset;
 } ApmIntProcInfo;
 
-#endif
+typedef struct GoLabelsOffsets {
+  u32 m_offset;
+  u32 curg;
+  u32 labels;
+  u32 hmap_count;
+  u32 hmap_log2_bucket_count;
+  u32 hmap_buckets;
+  s32 tls_offset;
+} GoLabelsOffsets;
+
+#endif // OPTI_TYPES_H

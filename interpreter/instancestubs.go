@@ -4,12 +4,11 @@
 package interpreter // import "go.opentelemetry.io/ebpf-profiler/interpreter"
 
 import (
-	"go.opentelemetry.io/ebpf-profiler/host"
+	"go.opentelemetry.io/ebpf-profiler/libc"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
-	"go.opentelemetry.io/ebpf-profiler/tpbase"
 )
 
 // InstanceStubs provides empty implementations of Instance hooks that are
@@ -17,19 +16,23 @@ import (
 type InstanceStubs struct {
 }
 
-func (is *InstanceStubs) SynchronizeMappings(EbpfHandler, reporter.SymbolReporter, process.Process,
-	[]process.Mapping) error {
+func (is *InstanceStubs) SynchronizeMappings(EbpfHandler, reporter.ExecutableReporter,
+	process.Process, []process.RawMapping) error {
 	return nil
 }
 
-func (is *InstanceStubs) UpdateTSDInfo(EbpfHandler, libpf.PID, tpbase.TSDInfo) error {
+func (is *InstanceStubs) UpdateLibcInfo(EbpfHandler, libpf.PID, libc.LibcInfo) error {
 	return nil
 }
 
-func (is *InstanceStubs) Symbolize(reporter.SymbolReporter, *host.Frame, *libpf.Trace) error {
+func (is *InstanceStubs) Symbolize(libpf.EbpfFrame, *libpf.Frames, libpf.FrameMapping) error {
 	return ErrMismatchInterpreterType
 }
 
 func (is *InstanceStubs) GetAndResetMetrics() ([]metrics.Metric, error) {
 	return []metrics.Metric{}, nil
+}
+
+func (is *InstanceStubs) ReleaseResources() error {
+	return nil
 }

@@ -8,13 +8,13 @@ import (
 	"unsafe"
 
 	"go.opentelemetry.io/ebpf-profiler/host"
+	"go.opentelemetry.io/ebpf-profiler/libc"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/lpm"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
-	"go.opentelemetry.io/ebpf-profiler/tpbase"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
@@ -22,16 +22,22 @@ const (
 	// LruFunctionCacheSize is the LRU size for caching functions for an interpreter.
 	// This should reflect the number of hot functions that are seen often in a trace.
 	LruFunctionCacheSize = 1024
-
-	// UnknownSourceFile is the source file name to use when the real one is not available
-	UnknownSourceFile = "<unknown>"
-
-	// TopLevelFunctionName is the name to be used when a function does not have a name,
-	// but we can deduce that it is at the highest possible scope (e.g for top-level PHP code)
-	TopLevelFunctionName = "<top-level>"
 )
 
 var (
+	// UnknownSourceFile is the source file name to use when the real one is not available
+	UnknownSourceFile = libpf.Intern("<unknown>")
+
+	// AnonymousFunction is the name to be used when a function is anonymous.
+	AnonymousFunctionName = libpf.Intern("<anonymous>")
+
+	// TopLevelFunctionName is the name to be used when a function does not have a name,
+	// but we can deduce that it is at the highest possible scope (e.g for top-level PHP code)
+	TopLevelFunctionName = libpf.Intern("<top-level>")
+
+	// UnknownFunction is the name to be used when a function name is not known.
+	UnknownFunctionName = libpf.Intern("<unknown>")
+
 	ErrMismatchInterpreterType = errors.New("mismatched interpreter type")
 )
 
@@ -120,6 +126,9 @@ type Data interface {
 	// of it to the ebpf maps.
 	Attach(ebpf EbpfHandler, pid libpf.PID, bias libpf.Address, rm remotememory.RemoteMemory) (
 		Instance, error)
+
+	// Unload can undo any allocations or eBPF entries the Loader function created
+	Unload(ebpf EbpfHandler)
 }
 
 // Instance is the interface to operate on per-PID data.
@@ -128,23 +137,35 @@ type Instance interface {
 	// simple interpreters can use the global Data also as the Instance implementation.
 	Detach(ebpf EbpfHandler, pid libpf.PID) error
 
-	// SynchronizeMappings is called when the processmanager has reread process memory
-	// mappings. Interpreters not needing to process these events can simply ignore them
-	// by just returning a nil.
-	SynchronizeMappings(ebpf EbpfHandler, symbolReporter reporter.SymbolReporter,
-		pr process.Process, mappings []process.Mapping) error
+	// SynchronizeMappings is called when the processmanager has reread process
+	// memory mappings. The mappings slice contains only the subset of mappings
+	// that are relevant to interpreters: executable anonymous mappings (for JIT
+	// engines like HotSpot, V8, BEAM) and DLL file-backed mappings (for .NET
+	// PE assemblies). The processmanager decides which mappings are included;
+	// this can be made more dynamic in the future if needed.
+	//
+	// The mappings are in /proc/PID/maps order (ascending by virtual address)
+	// but are NOT sorted by any other criteria. Interpreters that need a
+	// specific ordering must sort locally.
+	//
+	// Interpreters not needing to process these events can simply ignore them
+	// by returning nil.
+	SynchronizeMappings(ebpf EbpfHandler, exeReporter reporter.ExecutableReporter,
+		pr process.Process, mappings []process.RawMapping) error
 
-	// UpdateTSDInfo is called when the process C-library Thread Specific Data related
+	// UpdateLibcInfo is called when the process C-library related
 	// introspection data has been updated.
-	UpdateTSDInfo(ebpf EbpfHandler, pid libpf.PID, info tpbase.TSDInfo) error
+	UpdateLibcInfo(ebpf EbpfHandler, pid libpf.PID, info libc.LibcInfo) error
 
-	// Symbolize requests symbolization of the given frame, and dispatches this symbolization
-	// to the collection agent. The frame's contents (frame type, file ID and line number)
-	// are appended to newTrace.
-	Symbolize(symbolReporter reporter.SymbolReporter, frame *host.Frame,
-		trace *libpf.Trace) error
+	// Symbolize converts one ebpf frame to one or more (if inlining was expanded) libpf.Frame.
+	// The 'mapping' is set only when symbolizing native frames.
+	// The resulting libpf.Frame values are appended to frames.
+	Symbolize(ef libpf.EbpfFrame, frames *libpf.Frames, mapping libpf.FrameMapping) error
 
 	// GetAndResetMetrics collects the metrics from the Instance and resets
 	// the counters to their initial value.
 	GetAndResetMetrics() ([]metrics.Metric, error)
+
+	// Release resources that are used to symbolize a stack.
+	ReleaseResources() error
 }

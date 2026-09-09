@@ -6,9 +6,10 @@ package main
 import (
 	"unsafe"
 
-	"go.opentelemetry.io/ebpf-profiler/host"
+	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
+	"go.opentelemetry.io/ebpf-profiler/support"
 )
 
 /*
@@ -22,7 +23,7 @@ import "C"
 // ebpfContext is the context for EBPF code regarding the process it's unwinding.
 type ebpfContext struct {
 	// trace will contain the trace from the CGO executed eBPF unwinding code
-	trace host.Trace
+	trace libpf.EbpfTrace
 
 	// remotememory provides access to the target process memory space
 	remoteMemory remotememory.RemoteMemory
@@ -52,14 +53,18 @@ type ebpfContext struct {
 
 	// maps is the generic ebpf map implementation and implements all the
 	// ebpf maps that do not need special handling (maps defined above)
-	maps map[*C.bpf_map_def]map[any]unsafe.Pointer
-
-	// systemConfig holds an instance of `SystemConfig`, the common map
-	// for storing configuration that is populated by the host-agent.
-	systemConfig unsafe.Pointer
+	maps map[unsafe.Pointer]map[any]unsafe.Pointer
 
 	// stackDeltaFileID is context variable for nested map lookups
 	stackDeltaFileID C.u64
+
+	// faultAddresses maps user-space addresses on which
+	// bpf_probe_read_user_with_test_fault should pretend the kernel could not
+	// read (returns -1) to a hit counter. The presence of a key (regardless of
+	// value) is what triggers the fault; the int value records how many times
+	// the helper visited that address during the unwind so tests can assert
+	// every injected fault actually exercised the code path under test.
+	faultAddresses map[uintptr]int
 }
 
 // ebpfContextMap is global mapping of EBPFContext id (PIDandTGID) to the actual data.
@@ -68,40 +73,29 @@ type ebpfContext struct {
 // passed directly to the C code).
 var ebpfContextMap = map[C.u64]*ebpfContext{}
 
-// newEBPFContext creates new EBPF Context from given core dump image
-func newEBPFContext(pr process.Process) *ebpfContext {
+// newEBPFContext creates new EBPF Context from given core dump image. The
+// faultAddresses map, if non-empty, instructs bpf_probe_read_user_with_test_fault
+// to return -1 for those addresses; the int value of each entry is incremented
+// each time the helper visits the address.
+func newEBPFContext(pr process.Process, faultAddresses map[uintptr]int) *ebpfContext {
 	pid := pr.PID()
-	unwindInfoArray := C.unwind_info_array
 	ctx := &ebpfContext{
-		trace:                 host.Trace{PID: pid},
+		trace:                 libpf.EbpfTrace{PID: pid},
 		remoteMemory:          pr.GetRemoteMemory(),
 		PIDandTGID:            C.u64(pid) << 32,
 		pidToPageMapping:      make(map[C.PIDPage]unsafe.Pointer),
 		stackDeltaPageToInfo:  make(map[C.StackDeltaPageKey]unsafe.Pointer),
 		exeIDToStackDeltaMaps: make(map[C.u64]unsafe.Pointer),
-		maps:                  make(map[*C.bpf_map_def]map[any]unsafe.Pointer),
-		systemConfig:          initSystemConfig(pr.GetMachineData()),
+		maps:                  make(map[unsafe.Pointer]map[any]unsafe.Pointer),
 		perCPURecord:          C.malloc(C.sizeof_PerCPURecord),
-		unwindInfoArray:       C.malloc(C.sizeof_UnwindInfo * C.ulong(unwindInfoArray.max_entries)),
+		unwindInfoArray:       C.malloc(C.sizeof_UnwindInfo * C.ulong(support.UnwindInfoMaxEntries)),
+		faultAddresses:        faultAddresses,
 	}
 	ebpfContextMap[ctx.PIDandTGID] = ctx
 	return ctx
 }
 
-func initSystemConfig(md process.MachineData) unsafe.Pointer {
-	rawPtr := C.malloc(C.sizeof_SystemConfig)
-	sv := (*C.SystemConfig)(rawPtr)
-
-	sv.inverse_pac_mask = ^C.u64(md.CodePACMask)
-	// `tsd_get_base`, the function reading this field, is special-cased
-	// for coredump tests via `ifdefs`, so the value we set here doesn't matter.
-	sv.tpbase_offset = 0
-	sv.drop_error_only_traces = C.bool(false)
-
-	return rawPtr
-}
-
-func (ec *ebpfContext) addMap(mapPtr *C.bpf_map_def, key any, value []byte) {
+func (ec *ebpfContext) addMap(mapPtr unsafe.Pointer, key any, value []byte) {
 	innerMap, ok := ec.maps[mapPtr]
 	if !ok {
 		innerMap = make(map[any]unsafe.Pointer)
@@ -110,7 +104,7 @@ func (ec *ebpfContext) addMap(mapPtr *C.bpf_map_def, key any, value []byte) {
 	innerMap[key] = C.CBytes(value)
 }
 
-func (ec *ebpfContext) delMap(mapPtr *C.bpf_map_def, key any) {
+func (ec *ebpfContext) delMap(mapPtr unsafe.Pointer, key any) {
 	if innerMap, ok := ec.maps[mapPtr]; ok {
 		if value, ok2 := innerMap[key]; ok2 {
 			C.free(value)
@@ -120,13 +114,12 @@ func (ec *ebpfContext) delMap(mapPtr *C.bpf_map_def, key any) {
 }
 
 func (ec *ebpfContext) resetTrace() {
-	ec.trace.Frames = ec.trace.Frames[0:0]
+	ec.trace.FrameData = nil
 }
 
 func (ec *ebpfContext) release() {
 	C.free(ec.perCPURecord)
 	C.free(ec.unwindInfoArray)
-	C.free(ec.systemConfig)
 
 	for pidPage, pageInfo := range ec.pidToPageMapping {
 		C.free(pageInfo)

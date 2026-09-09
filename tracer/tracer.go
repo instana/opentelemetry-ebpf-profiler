@@ -6,15 +6,18 @@ package tracer // import "go.opentelemetry.io/ebpf-profiler/tracer"
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"math"
 	"math/rand/v2"
-	"sort"
+	"os"
+	"path"
+	"runtime"
+	"slices"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -22,35 +25,27 @@ import (
 	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/link"
 	"github.com/elastic/go-perf"
-	log "github.com/sirupsen/logrus"
-	"github.com/zeebo/xxh3"
+	"go.opentelemetry.io/ebpf-profiler/internal/linux"
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
+	"go.opentelemetry.io/ebpf-profiler/libpf/pfunsafe"
 
-	"go.opentelemetry.io/ebpf-profiler/host"
+	"go.opentelemetry.io/ebpf-profiler/kallsyms"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
-	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/xsync"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/nativeunwind/elfunwindinfo"
 	"go.opentelemetry.io/ebpf-profiler/periodiccaller"
-	"go.opentelemetry.io/ebpf-profiler/proc"
 	pm "go.opentelemetry.io/ebpf-profiler/processmanager"
 	pmebpf "go.opentelemetry.io/ebpf-profiler/processmanager/ebpf"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/rlimit"
 	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/times"
-	"go.opentelemetry.io/ebpf-profiler/tracehandler"
 	"go.opentelemetry.io/ebpf-profiler/tracer/types"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
-/*
-#include <stdint.h>
-#include "../support/ebpf/types.h"
-*/
-import "C"
-
-// Compile time check to make sure config.Times satisfies the interfaces.
+// Compile time check to make sure times.Times satisfies the interfaces.
 var _ Intervals = (*times.Times)(nil)
 
 const (
@@ -65,29 +60,40 @@ const (
 	probProfilingDisable = -1
 )
 
+// Names of tracepoint hooks for sched_process_free. There are two hooks
+// as the tracepoint format has changed for kernel versions 6.16+.
+const (
+	schedProcessFreeV1 = "tracepoint__sched_process_free_pre616"
+	schedProcessFreeV2 = "tracepoint__sched_process_free"
+)
+
+// Shared map name according to
+// https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/blob/main/devdocs/trace-profile-correlation.md
+const (
+	obiSpanTracesMap = "traces_ctx_v1"
+)
+
 // Intervals is a subset of config.IntervalsAndTimers.
 type Intervals interface {
 	MonitorInterval() time.Duration
 	TracePollInterval() time.Duration
 	PIDCleanupInterval() time.Duration
+	ExecutableUnloadDelay() time.Duration
 }
+
+// onlineCPUs once resolves and caches the list of online CPUs.
+var onlineCPUsOnce = sync.OnceValues(getOnlineCPUIDs)
 
 // Tracer provides an interface for loading and initializing the eBPF components as
 // well as for monitoring the output maps for new traces and count updates.
 type Tracer struct {
-	fallbackSymbolHit  atomic.Uint64
-	fallbackSymbolMiss atomic.Uint64
-
 	// ebpfMaps holds the currently loaded eBPF maps.
 	ebpfMaps map[string]*cebpf.Map
 	// ebpfProgs holds the currently loaded eBPF programs.
 	ebpfProgs map[string]*cebpf.Program
 
-	// kernelSymbols is used to hold the kernel symbol addresses we are tracking
-	kernelSymbols *libpf.SymbolMap
-
-	// kernelModules holds symbols/addresses for the kernel module address space
-	kernelModules *libpf.SymbolMap
+	// kernelSymbolizer does kernel fallback symbolization
+	kernelSymbolizer *kallsyms.Symbolizer
 
 	// perfEntrypoints holds a list of frequency based perf events that are opened on the system.
 	perfEntrypoints xsync.RWMutex[[]*perf.Event]
@@ -100,26 +106,22 @@ type Tracer struct {
 	// associated eBPF maps.
 	processManager *pm.ProcessManager
 
+	// tracePool is cache of libpf.EbpfTrace to avoid GC pressure
+	tracePool sync.Pool
+
 	// triggerPIDProcessing is used as manual trigger channel to request immediate
 	// processing of pending PIDs. This is requested on notifications from eBPF code
 	// when process events take place (new, exit, unknown PC).
 	triggerPIDProcessing chan bool
 
-	// pidEvents notifies the tracer of new PID events.
+	// pidEvents notifies the tracer of new PID events. Each PID event is a 64bit integer
+	// value, see bpf_get_current_pid_tgid for information on how the value is encoded.
 	// It needs to be buffered to avoid locking the writers and stacking up resources when we
 	// read new PIDs at startup or notified via eBPF.
-	pidEvents chan libpf.PID
+	pidEvents chan libpf.PIDTID
 
 	// intervals provides access to globally configured timers and counters.
 	intervals Intervals
-
-	hasBatchOperations bool
-
-	// moduleFileIDs maps kernel module names to their respective FileID.
-	moduleFileIDs map[string]libpf.FileID
-
-	// reporter allows swapping out the reporter implementation.
-	reporter reporter.SymbolReporter
 
 	// samplesPerSecond holds the configured number of samples per second.
 	samplesPerSecond int
@@ -129,11 +131,32 @@ type Tracer struct {
 
 	// probabilisticThreshold holds the threshold for probabilistic profiling.
 	probabilisticThreshold uint
+
+	// done is closed when the tracer encounters an unrecoverable error.
+	// Use Done() to obtain a read-only channel for use in select statements.
+	done     chan libpf.Void
+	doneOnce sync.Once
+}
+
+// Done returns a channel that is closed when the tracer encounters an
+// unrecoverable error. It can be used in select statements to detect
+// when the tracer should be stopped.
+func (t *Tracer) Done() <-chan libpf.Void {
+	return t.done
+}
+
+// signalDone closes the done channel to indicate an unrecoverable error.
+// It is safe to call multiple times.
+func (t *Tracer) signalDone() {
+	t.doneOnce.Do(func() { close(t.done) })
 }
 
 type Config struct {
-	// Reporter allows swapping out the reporter implementation.
-	Reporter reporter.SymbolReporter
+	// ExecutableReporter allows to configure a ExecutableReporter to hook seen executables.
+	// NOTE: This is used by external implementations embedding opentelemtry-ebpf-profiler.
+	ExecutableReporter reporter.ExecutableReporter
+	// TraceReporter is the interface to report traces with.
+	TraceReporter reporter.TraceReporter
 	// Intervals provides access to globally configured timers and counters.
 	Intervals Intervals
 	// IncludeTracers holds information about which tracers are enabled.
@@ -144,10 +167,12 @@ type Config struct {
 	MapScaleFactor int
 	// FilterErrorFrames indicates whether error frames should be filtered.
 	FilterErrorFrames bool
+	// FilterIdleFrames indicates whether idle frames should be filtered.
+	FilterIdleFrames bool
 	// KernelVersionCheck indicates whether the kernel version should be checked.
 	KernelVersionCheck bool
-	// DebugTracer indicates whether to load the debug version of eBPF tracers.
-	DebugTracer bool
+	// VerboseMode indicates whether to enable verbose output of eBPF tracers.
+	VerboseMode bool
 	// BPFVerifierLogLevel is the log level of the eBPF verifier output.
 	BPFVerifierLogLevel uint32
 	// ProbabilisticInterval is the time interval for which probabilistic profiling will be enabled.
@@ -156,6 +181,19 @@ type Config struct {
 	ProbabilisticThreshold uint
 	// OffCPUThreshold is the user defined threshold for off-cpu profiling.
 	OffCPUThreshold uint32
+	// IncludeEnvVars holds a list of environment variables that should be captured and reported
+	// from processes
+	IncludeEnvVars libpf.Set[string]
+	// Probes holds a list of probe_type:target[:symbol] elements to which
+	// a probe will be attached.
+	ProbeLinks []string
+	// LoadProbe indicates whether the generic eBPF program should be loaded
+	// without being attached to something.
+	LoadProbe bool
+	// BPFFSRoot is the root path to BPF filesystem for pinned maps and programs.
+	BPFFSRoot string
+	// OBIProcessCtx enable the use of a known shared eBPF map with OBI.
+	OBIProcessCtx bool
 }
 
 // hookPoint specifies the group and name of the hooked point in the kernel.
@@ -175,178 +213,91 @@ type progLoaderHelper struct {
 	noTailCallTarget bool
 }
 
-// processKernelModulesMetadata computes the FileID of kernel files and reports executable metadata
-// for all kernel modules and the vmlinux image.
-func processKernelModulesMetadata(rep reporter.SymbolReporter, kernelModules *libpf.SymbolMap,
-	kernelSymbols *libpf.SymbolMap) (map[string]libpf.FileID, error) {
-	result := make(map[string]libpf.FileID, kernelModules.Len())
-	kernelModules.VisitAll(func(moduleSym libpf.Symbol) {
-		nameStr := string(moduleSym.Name)
-		if !util.IsValidString(nameStr) {
-			log.Errorf("Invalid string representation of file name in "+
-				"processKernelModulesMetadata: %v", []byte(nameStr))
-			return
-		}
-
-		// Read the kernel and modules ELF notes from sysfs (works since Linux 2.6.24)
-		notesFile := fmt.Sprintf("/sys/module/%s/notes/.note.gnu.build-id", nameStr)
-
-		// The vmlinux notes section is in a different location
-		if nameStr == "vmlinux" {
-			notesFile = "/sys/kernel/notes"
-		}
-
-		buildID, err := pfelf.GetBuildIDFromNotesFile(notesFile)
-		var fileID libpf.FileID
-		// Require at least 16 bytes of BuildID to ensure there is enough entropy for a FileID.
-		// 16 bytes could happen when --build-id=md5 is passed to `ld`. This would imply a custom
-		// kernel.
-		if err == nil && len(buildID) >= 16 {
-			fileID = libpf.FileIDFromKernelBuildID(buildID)
-		} else {
-			fileID = calcFallbackModuleID(moduleSym, kernelSymbols)
-			buildID = ""
-		}
-
-		result[nameStr] = fileID
-		rep.ExecutableMetadata(&reporter.ExecutableMetadataArgs{
-			FileID:            fileID,
-			FileName:          nameStr,
-			GnuBuildID:        buildID,
-			DebuglinkFileName: "",
-			Interp:            libpf.Kernel,
-		})
-	})
-
-	return result, nil
+// Convert a C-string to Go string.
+func goString(cstr []byte) libpf.String {
+	index := bytes.IndexByte(cstr, byte(0))
+	if index < 0 {
+		index = len(cstr)
+	}
+	return libpf.Intern(pfunsafe.ToString(cstr[:index]))
 }
 
-// calcFallbackModuleID computes a fallback file ID for kernel modules that do not
-// have a GNU build ID. Getting the actual file for the kernel module isn't always
-// possible since they don't necessarily reside on disk, e.g. when modules are loaded
-// from the initramfs that is later unmounted again.
-//
-// This fallback checksum locates all symbols exported by a given driver, normalizes
-// them to offsets and hashes over that. Additionally, the module's name and size are
-// hashed as well. This isn't perfect, and we can't do any server-side symbolization
-// with these IDs, but at least it provides a stable unique key for the kernel fallback
-// symbols that we send.
-func calcFallbackModuleID(moduleSym libpf.Symbol, kernelSymbols *libpf.SymbolMap) libpf.FileID {
-	modStart := moduleSym.Address
-	modEnd := moduleSym.Address + libpf.SymbolValue(moduleSym.Size)
-
-	// Collect symbols belonging to this module + track minimum address.
-	var moduleSymbols []libpf.Symbol
-	minAddr := libpf.SymbolValue(math.MaxUint64)
-	kernelSymbols.VisitAll(func(symbol libpf.Symbol) {
-		if symbol.Address >= modStart && symbol.Address < modEnd {
-			moduleSymbols = append(moduleSymbols, symbol)
-			minAddr = min(minAddr, symbol.Address)
-		}
-	})
-
-	// Ensure consistent order.
-	sort.Slice(moduleSymbols, func(a, b int) bool {
-		return moduleSymbols[a].Address < moduleSymbols[b].Address
-	})
-
-	// Hash exports and their normalized addresses.
-	h := fnv.New128a()
-	h.Write([]byte(moduleSym.Name))
-	h.Write(libpf.SliceFrom(&moduleSym.Size))
-
-	for _, sym := range moduleSymbols {
-		sym.Address -= minAddr // KASLR normalization
-
-		h.Write([]byte(sym.Name))
-		h.Write(libpf.SliceFrom(&sym.Address))
+// schedProcessFreeHookName returns the name of the tracepoint hook to use.
+// This function requires that only one of (schedProcessFreeV1, schedProcessFreeV2)
+// be present in progNames.
+func schedProcessFreeHookName(progNames libpf.Set[string]) string {
+	if _, ok := progNames[schedProcessFreeV1]; ok {
+		return schedProcessFreeV1
 	}
+	return schedProcessFreeV2
+}
 
-	var hash [16]byte
-	fileID, err := libpf.FileIDFromBytes(h.Sum(hash[:0]))
-	if err != nil {
-		panic("calcFallbackModuleID file ID construction is broken")
+func newTracePool() sync.Pool {
+	return sync.Pool{
+		New: func() any {
+			return &libpf.EbpfTrace{}
+		},
 	}
-
-	log.Debugf("Fallback module ID for module %s is '%s' (min addr: 0x%08X, num exports: %d)",
-		moduleSym.Name, fileID.Base64(), minAddr, len(moduleSymbols))
-
-	return fileID
 }
 
 // NewTracer loads eBPF code and map definitions from the ELF module at the configured path.
 func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
-	kernelSymbols, err := proc.GetKallsyms("/proc/kallsyms")
+	kernelSymbolizer, err := kallsyms.NewSymbolizer()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read kernel symbols: %v", err)
+	}
+
+	kmod, err := kernelSymbolizer.GetModuleByName(kallsyms.Kernel)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read kernel symbols: %v", err)
 	}
 
 	// Based on includeTracers we decide later which are loaded into the kernel.
-	ebpfMaps, ebpfProgs, err := initializeMapsAndPrograms(kernelSymbols, cfg)
+	ebpfMaps, ebpfProgs, stackdeltaInnerMapSpec, err := initializeMapsAndPrograms(kmod, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load eBPF code: %v", err)
 	}
 
-	ebpfHandler, err := pmebpf.LoadMaps(ctx, ebpfMaps)
+	ebpfHandler, err := pmebpf.LoadMaps(ctx, cfg.IncludeTracers, ebpfMaps, stackdeltaInnerMapSpec)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load eBPF maps: %v", err)
 	}
 
-	hasBatchOperations := ebpfHandler.SupportsGenericBatchOperations()
-
 	processManager, err := pm.New(ctx, cfg.IncludeTracers, cfg.Intervals.MonitorInterval(),
-		ebpfHandler, nil, cfg.Reporter, elfunwindinfo.NewStackDeltaProvider(),
-		cfg.FilterErrorFrames)
+		cfg.Intervals.ExecutableUnloadDelay(), ebpfHandler, cfg.TraceReporter, cfg.ExecutableReporter,
+		elfunwindinfo.NewStackDeltaProvider(),
+		cfg.FilterErrorFrames, cfg.IncludeEnvVars)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create processManager: %v", err)
 	}
 
-	const fallbackSymbolsCacheSize = 16384
-
-	kernelModules, err := proc.GetKernelModules("/proc/modules", kernelSymbols)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read kernel modules: %v", err)
-	}
-
-	moduleFileIDs, err := processKernelModulesMetadata(cfg.Reporter, kernelModules, kernelSymbols)
-	if err != nil {
-		return nil, fmt.Errorf("failed to extract kernel modules metadata: %v", err)
-	}
-
 	perfEventList := []*perf.Event{}
 
-	return &Tracer{
+	tracer := &Tracer{
+		kernelSymbolizer:       kernelSymbolizer,
 		processManager:         processManager,
-		kernelSymbols:          kernelSymbols,
-		kernelModules:          kernelModules,
 		triggerPIDProcessing:   make(chan bool, 1),
-		pidEvents:              make(chan libpf.PID, pidEventBufferSize),
+		tracePool:              newTracePool(),
+		pidEvents:              make(chan libpf.PIDTID, pidEventBufferSize),
 		ebpfMaps:               ebpfMaps,
 		ebpfProgs:              ebpfProgs,
 		hooks:                  make(map[hookPoint]link.Link),
 		intervals:              cfg.Intervals,
-		hasBatchOperations:     hasBatchOperations,
 		perfEntrypoints:        xsync.NewRWMutex(perfEventList),
-		moduleFileIDs:          moduleFileIDs,
-		reporter:               cfg.Reporter,
 		samplesPerSecond:       cfg.SamplesPerSecond,
 		probabilisticInterval:  cfg.ProbabilisticInterval,
 		probabilisticThreshold: cfg.ProbabilisticThreshold,
-	}, nil
+		done:                   make(chan libpf.Void),
+	}
+
+	return tracer, nil
 }
 
 // Close provides functionality for Tracer to perform cleanup tasks.
 // NOTE: Close may be called multiple times in succession.
 func (t *Tracer) Close() {
 	events := t.perfEntrypoints.WLock()
-	for _, event := range *events {
-		if err := event.Disable(); err != nil {
-			log.Errorf("Failed to disable perf event: %v", err)
-		}
-		if err := event.Close(); err != nil {
-			log.Errorf("Failed to close perf event: %v", err)
-		}
-	}
+	terminatePerfEvents(*events)
 	*events = nil
 	t.perfEntrypoints.WUnlock(&events)
 
@@ -359,73 +310,74 @@ func (t *Tracer) Close() {
 	}
 
 	t.processManager.Close()
-}
-
-func buildStackDeltaTemplates(coll *cebpf.CollectionSpec) error {
-	// Prepare the inner map template of the stack deltas map-of-maps.
-	// This cannot be provided from the eBPF C code, and needs to be done here.
-	for i := support.StackDeltaBucketSmallest; i <= support.StackDeltaBucketLargest; i++ {
-		mapName := fmt.Sprintf("exe_id_to_%d_stack_deltas", i)
-		def := coll.Maps[mapName]
-		if def == nil {
-			return fmt.Errorf("ebpf map '%s' not found", mapName)
-		}
-		def.InnerMap = &cebpf.MapSpec{
-			Type:       cebpf.Array,
-			KeySize:    uint32(C.sizeof_uint32_t),
-			ValueSize:  uint32(C.sizeof_StackDelta),
-			MaxEntries: 1 << i,
-		}
-	}
-	return nil
+	t.kernelSymbolizer.Close()
+	t.signalDone()
 }
 
 // initializeMapsAndPrograms loads the definitions for the eBPF maps and programs provided
 // by the embedded elf file and loads these into the kernel.
-func initializeMapsAndPrograms(kernelSymbols *libpf.SymbolMap, cfg *Config) (
-	ebpfMaps map[string]*cebpf.Map, ebpfProgs map[string]*cebpf.Program, err error) {
+func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config) (
+	ebpfMaps map[string]*cebpf.Map, ebpfProgs map[string]*cebpf.Program,
+	stackdeltaInnerMapSpec *cebpf.MapSpec, err error,
+) {
 	// Loading specifications about eBPF programs and maps from the embedded elf file
 	// does not load them into the kernel.
 	// A collection specification holds the information about eBPF programs and maps.
 	// References to eBPF maps in the eBPF programs are just placeholders that need to be
-	// replaced by the actual loaded maps later on with RewriteMaps before loading the
+	// replaced by the actual loaded maps later on with rewriteMaps before loading the
 	// programs into the kernel.
-	coll, err := support.LoadCollectionSpec(cfg.DebugTracer)
+	major, minor, patch, err := linux.GetCurrentKernelVersion()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to load specification for tracers: %v", err)
+		return nil, nil, nil, fmt.Errorf("failed to get kernel version: %v", err)
 	}
 
-	err = buildStackDeltaTemplates(coll)
+	coll, err := support.LoadCollectionSpec()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, fmt.Errorf("failed to load specification for tracers: %v", err)
+	}
+
+	if major > 6 || (major == 6 && minor >= 16) {
+		// Tracepoint format for sched_process_free has changed in v6.16+.
+		delete(coll.Programs, schedProcessFreeV1)
+	} else {
+		delete(coll.Programs, schedProcessFreeV2)
+	}
+
+	// Initialize eBPF variables before loading programs and maps.
+	if err = loadRodataVars(coll, kmod, cfg); err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to set RODATA variables: %v", err)
 	}
 
 	ebpfMaps = make(map[string]*cebpf.Map)
 	ebpfProgs = make(map[string]*cebpf.Program)
 
+	// Use the specification of the first exe_id_to_Y_stack_deltas inner map
+	// as template for further updates.
+	innerMapTemplate := coll.Maps["exe_id_to_8_stack_deltas"].InnerMap.Copy()
+
+	// Since we load maps individually with cebpf.NewMap, we must manually propagate
+	// variable values back into the map spec contents before creating the maps.
+	if err = syncVariablesToMapSpecs(coll); err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to sync variables to map specs: %v", err)
+	}
+
 	// Load all maps into the kernel that are used later on in eBPF programs. So we can rewrite
 	// in the next step the placesholders in the eBPF programs with the file descriptors of the
 	// loaded maps in the kernel.
 	if err = loadAllMaps(coll, cfg, ebpfMaps); err != nil {
-		return nil, nil, fmt.Errorf("failed to load eBPF maps: %v", err)
+		return nil, nil, nil, fmt.Errorf("failed to load eBPF maps: %v", err)
 	}
 
 	// Replace the place holders for map access in the eBPF programs with
 	// the file descriptors of the loaded maps.
-	//nolint:staticcheck
-	if err = coll.RewriteMaps(ebpfMaps); err != nil {
-		return nil, nil, fmt.Errorf("failed to rewrite maps: %v", err)
+	if err = rewriteMaps(coll, ebpfMaps); err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to rewrite maps: %v", err)
 	}
 
 	if cfg.KernelVersionCheck {
-		var major, minor, patch uint32
-		major, minor, patch, err = GetCurrentKernelVersion()
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to get kernel version: %v", err)
-		}
 		if hasProbeReadBug(major, minor, patch) {
-			if err = checkForMaccessPatch(coll, ebpfMaps, kernelSymbols); err != nil {
-				return nil, nil, fmt.Errorf("your kernel version %d.%d.%d may be "+
+			if err = checkForMaccessPatch(coll, ebpfMaps, kmod); err != nil {
+				return nil, nil, nil, fmt.Errorf("your kernel version %d.%d.%d may be "+
 					"affected by a Linux kernel bug that can lead to system "+
 					"freezes, terminating host agent now to avoid "+
 					"triggering this bug.\n"+
@@ -483,30 +435,74 @@ func initializeMapsAndPrograms(kernelSymbols *libpf.SymbolMap, cfg *Config) (
 			name:   "unwind_dotnet",
 			enable: cfg.IncludeTracers.Has(types.DotnetTracer),
 		},
+		{
+			progID: uint32(support.ProgUnwindDotnet10),
+			name:   "unwind_dotnet10",
+			enable: cfg.IncludeTracers.Has(types.DotnetTracer),
+		},
+		{
+			progID: uint32(support.ProgGoLabels),
+			name:   "go_labels",
+			enable: cfg.IncludeTracers.Has(types.Labels),
+		},
+		{
+			progID: uint32(support.ProgUnwindBEAM),
+			name:   "unwind_beam",
+			enable: cfg.IncludeTracers.Has(types.BEAMTracer),
+		},
 	}
 
 	if err = loadPerfUnwinders(coll, ebpfProgs, ebpfMaps["perf_progs"], tailCallProgs,
 		cfg.BPFVerifierLogLevel); err != nil {
-		return nil, nil, fmt.Errorf("failed to load perf eBPF programs: %v", err)
+		return nil, nil, nil, fmt.Errorf("failed to load perf eBPF programs: %v", err)
 	}
 
-	if cfg.OffCPUThreshold < support.OffCPUThresholdMax {
-		if err = loadKProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], tailCallProgs,
+	if cfg.OffCPUThreshold > 0 || len(cfg.ProbeLinks) > 0 || cfg.LoadProbe {
+		// Load the tail call destinations if any kind of event profiling is enabled.
+		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], tailCallProgs,
 			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD()); err != nil {
-			return nil, nil, fmt.Errorf("failed to load kprobe eBPF programs: %v", err)
+			return nil, nil, nil, fmt.Errorf("failed to load kprobe eBPF programs: %v", err)
 		}
 	}
 
-	if err = loadSystemConfig(coll, ebpfMaps, kernelSymbols, cfg.IncludeTracers,
-		cfg.OffCPUThreshold, cfg.FilterErrorFrames); err != nil {
-		return nil, nil, fmt.Errorf("failed to load system config: %v", err)
+	if cfg.OffCPUThreshold > 0 {
+		offCPUProgs := []progLoaderHelper{
+			{
+				name:             "finish_task_switch",
+				noTailCallTarget: true,
+				enable:           true,
+			},
+			{
+				name:             "tracepoint__sched_switch",
+				noTailCallTarget: true,
+				enable:           true,
+			},
+		}
+		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], offCPUProgs,
+			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD()); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to load kprobe eBPF programs: %v", err)
+		}
+	}
+
+	if len(cfg.ProbeLinks) > 0 || cfg.LoadProbe {
+		probeProgs := []progLoaderHelper{
+			{
+				name:             genericProgName,
+				noTailCallTarget: true,
+				enable:           true,
+			},
+		}
+		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], probeProgs,
+			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD()); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to load uprobe eBPF programs: %v", err)
+		}
 	}
 
 	if err = removeTemporaryMaps(ebpfMaps); err != nil {
-		return nil, nil, fmt.Errorf("failed to remove temporary maps: %v", err)
+		return nil, nil, nil, fmt.Errorf("failed to remove temporary maps: %v", err)
 	}
 
-	return ebpfMaps, ebpfProgs, nil
+	return ebpfMaps, ebpfProgs, innerMapTemplate, nil
 }
 
 // removeTemporaryMaps unloads and deletes eBPF maps that are only required for the
@@ -522,9 +518,89 @@ func removeTemporaryMaps(ebpfMaps map[string]*cebpf.Map) error {
 	return nil
 }
 
+// rewriteMaps replaces all references to named eBPF maps.
+// This means that pre-existing maps are used, instead of new ones created
+// when calling NewCollection. Any named eBPF maps are removed from CollectionSpec.Maps.
+//
+// This function used to be part of cilium/ebpf before it got deprecated and finally removed.
+// As we require to resize maps in loadAllMaps() we still need this functionality.
+// cilium/ebpf deprecated this function as FDs from *cebpf.Map are taken, but no references to
+// the Map entries are kept. If no one else holds a reference to these Map entries, they can
+// get GCd, the FD closed and the program load fails.
+//
+// Returns an error if a named eBPF map isn't used in at least one program.
+func rewriteMaps(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map) error {
+	for symbol, m := range maps {
+		// have we seen a program that uses this symbol / map
+		seen := false
+		for progName, progSpec := range coll.Programs {
+			err := progSpec.Instructions.AssociateMap(symbol, m)
+
+			switch {
+			case err == nil:
+				seen = true
+
+			case errors.Is(err, asm.ErrUnreferencedSymbol):
+				// Not all programs need to use the map
+
+			default:
+				return fmt.Errorf("program %s: %w", progName, err)
+			}
+		}
+
+		if !seen {
+			return fmt.Errorf("map %s not referenced by any programs", symbol)
+		}
+
+		// Prevent NewCollection from creating rewritten maps
+		delete(coll.Maps, symbol)
+	}
+
+	return nil
+}
+
+// syncVariablesToMapSpecs copies VariableSpec values back into the corresponding
+// MapSpec contents. This is necessary starting from cilium/ebpf v0.21.0, as
+// VariableSpec.Set() only updates VariableSpec.Value and no longer directly
+// modifies the underlying MapSpec.Contents byte slice.
+func syncVariablesToMapSpecs(coll *cebpf.CollectionSpec) error {
+	for mapName, mapSpec := range coll.Maps {
+		if len(mapSpec.Contents) == 0 {
+			continue
+		}
+		data, ok := mapSpec.Contents[0].Value.([]byte)
+		if !ok {
+			continue
+		}
+		modified := false
+		for _, v := range coll.Variables {
+			if v.SectionName != mapName || len(v.Value) == 0 {
+				continue
+			}
+			end := int(v.Offset) + len(v.Value)
+			if end > len(data) {
+				return fmt.Errorf("variable %s (offset %d, size %d) exceeds map %s data size %d",
+					v.Name, v.Offset, len(v.Value), mapName, len(data))
+			}
+			if !modified {
+				// Clone the underlying slice to avoid modifying shared data
+				// (MapSpec.Copy performs a shallow copy of Contents).
+				data = slices.Clone(data)
+				modified = true
+			}
+			copy(data[v.Offset:end], v.Value)
+		}
+		if modified {
+			mapSpec.Contents[0] = cebpf.MapKV{Key: uint32(0), Value: data}
+		}
+	}
+	return nil
+}
+
 // loadAllMaps loads all eBPF maps that are used in our eBPF programs.
 func loadAllMaps(coll *cebpf.CollectionSpec, cfg *Config,
-	ebpfMaps map[string]*cebpf.Map) error {
+	ebpfMaps map[string]*cebpf.Map,
+) error {
 	restoreRlimit, err := rlimit.MaximizeMemlock()
 	if err != nil {
 		return fmt.Errorf("failed to adjust rlimit: %v", err)
@@ -535,26 +611,24 @@ func loadAllMaps(coll *cebpf.CollectionSpec, cfg *Config,
 	adaption := make(map[string]uint32, 4)
 
 	const (
-		// The following sizes X are used as 2^X, and determined empirically
-
+		// The following sizes X are used as 2^X, and determined empirically.
 		// 1 million executable pages / 4GB of executable address space
-		pidPageMappingInfoSize = 20
-
+		pidPageMappingInfoSize   = 20
 		stackDeltaPageToInfoSize = 16
 		exeIDToStackDeltasSize   = 16
 	)
 
-	adaption["pid_page_to_mapping_info"] =
-		1 << uint32(pidPageMappingInfoSize+cfg.MapScaleFactor)
-	adaption["stack_delta_page_to_info"] =
-		1 << uint32(stackDeltaPageToInfoSize+cfg.MapScaleFactor)
+	adaption["pid_page_to_mapping_info"] = 1 << uint32(pidPageMappingInfoSize+cfg.MapScaleFactor)
 
-	// To not loose too many scheduling events but also not oversize
-	// sched_times, calculate a size based on some assumptions.
-	// On modern systems /proc/sys/kernel/pid_max defaults to 4194304.
-	// Try to fit this PID space scaled down with cfg.OffCPUThreshold into
-	// this map.
-	adaption["sched_times"] = (4194304 / support.OffCPUThresholdMax) * cfg.OffCPUThreshold
+	adaption["stack_delta_page_to_info"] = 1 << uint32(stackDeltaPageToInfoSize+cfg.MapScaleFactor)
+
+	adaption["sched_times"] = schedTimesSize(cfg.OffCPUThreshold)
+
+	// Allow for 1s of 'burst' trace data (sizing by Trace length worst-case)
+	// TODO: Base this on present CPUs instead, as runtime.NumCPU is fixed for the lifetime
+	// of the process?
+	ringbufSize := uint64(cfg.SamplesPerSecond * runtime.NumCPU() * support.Sizeof_Trace)
+	adaption["trace_events"] = uint32(min(util.NextPowerOfTwo(ringbufSize), 1<<31))
 
 	for i := support.StackDeltaBucketSmallest; i <= support.StackDeltaBucketLargest; i++ {
 		mapName := fmt.Sprintf("exe_id_to_%d_stack_deltas", i)
@@ -562,38 +636,108 @@ func loadAllMaps(coll *cebpf.CollectionSpec, cfg *Config,
 	}
 
 	for mapName, mapSpec := range coll.Maps {
+		if mapName == "sched_times" && cfg.OffCPUThreshold == 0 {
+			// Off CPU Profiling is disabled. So do not load this map.
+			continue
+		}
+		if mapName == obiSpanTracesMap {
+			if cfg.BPFFSRoot == "" || !cfg.OBIProcessCtx {
+				// As BPF FS is not set or process context sharing with OBI is not
+				// enabled, the map can not be shared with other OTel components.
+				// To reduce the memory footprint in this case reduce the size of the map.
+				mapSpec.MaxEntries = 1
+			} else {
+				// Try to load it from a known path:
+				mPath := path.Join(cfg.BPFFSRoot, "otel", mapName)
+				ebpfMap, err := cebpf.LoadPinnedMap(mPath, &cebpf.LoadPinOptions{})
+				if err == nil {
+					log.Infof("Using shared map for OBI span/trace ID communication")
+					ebpfMaps[mapName] = ebpfMap
+					continue
+				}
+				// The shared map does not yet exist or BPF FS is not set - so continue as usual
+			}
+		}
+
+		if !types.IsMapEnabled(mapName, cfg.IncludeTracers) {
+			log.Debugf("Skipping eBPF map %s: tracer not enabled", mapName)
+			continue
+		}
 		if newSize, ok := adaption[mapName]; ok {
 			log.Debugf("Size of eBPF map %s: %v", mapName, newSize)
 			mapSpec.MaxEntries = newSize
-		}
-		if mapName == "sched_times" &&
-			cfg.OffCPUThreshold >= support.OffCPUThresholdMax {
-			// Off CPU Profiling is not enabled. So do not load this map.
-			continue
 		}
 		ebpfMap, err := cebpf.NewMap(mapSpec)
 		if err != nil {
 			return fmt.Errorf("failed to load %s: %v", mapName, err)
 		}
 		ebpfMaps[mapName] = ebpfMap
+
+		if mapName == obiSpanTracesMap {
+			if cfg.BPFFSRoot == "" || !cfg.OBIProcessCtx {
+				// In environments, where BPF FS is not available,
+				// we just load the map to not break eBPF programs.
+				log.Infof("Skip pinning eBPF map to share OTel span/trace IDs")
+				continue
+			}
+
+			// Pin the loaded map to a known path, so that other
+			// OTel components can also use it.
+			otelBPFFS := path.Join(cfg.BPFFSRoot, "otel")
+			if err := os.MkdirAll(otelBPFFS, 0o1700); err != nil {
+				// This is a non-fatal error for the functionality
+				// of the profiler. So just log it.
+				log.Warnf("Failed to create '%s'. OTel span/trace IDs can not be shared: %v",
+					otelBPFFS, err)
+				continue
+			}
+			if err := ebpfMap.Pin(path.Join(otelBPFFS, mapName)); err != nil {
+				// This is a non-fatal error for the functionality
+				// of the profiler. So just log it.
+				log.Warnf("Failed to pin '%s'. OTel span/trace IDs can not be shared: %v",
+					mapName, err)
+			}
+		}
 	}
 
 	return nil
 }
 
+// schedTimesSize calculates the size of the sched_times map based on the
+// configured off-cpu threshold.
+// To not lose too many scheduling events but also not oversize sched_times,
+// calculate a size based on an assumed upper bound of scheduler events per
+// second (1000hz) multiplied by an average time a task remains off CPU (3s),
+// scaled by the probability of capturing a trace.
+func schedTimesSize(threshold uint32) uint32 {
+	size := uint32((4096 * uint64(threshold)) / math.MaxUint32)
+	if size < 16 {
+		// Guarantee a minimal size of 16.
+		return 16
+	}
+	if size > 4096 {
+		// Guarantee a maximum size of 4096.
+		return 4096
+	}
+	return size
+}
+
 // loadPerfUnwinders loads all perf eBPF Programs and their tail call targets.
 func loadPerfUnwinders(coll *cebpf.CollectionSpec, ebpfProgs map[string]*cebpf.Program,
 	tailcallMap *cebpf.Map, tailCallProgs []progLoaderHelper,
-	bpfVerifierLogLevel uint32) error {
+	bpfVerifierLogLevel uint32,
+) error {
 	programOptions := cebpf.ProgramOptions{
 		LogLevel: cebpf.LogLevel(bpfVerifierLogLevel),
 	}
 
 	progs := make([]progLoaderHelper, len(tailCallProgs)+2)
 	copy(progs, tailCallProgs)
+
+	schedProcessFree := schedProcessFreeHookName(libpf.MapKeysToSet(coll.Programs))
 	progs = append(progs,
 		progLoaderHelper{
-			name:             "tracepoint__sched_process_exit",
+			name:             schedProcessFree,
 			noTailCallTarget: true,
 			enable:           true,
 		},
@@ -647,30 +791,16 @@ func progArrayReferences(perfTailCallMapFD int, insns asm.Instructions) []int {
 	return insNos
 }
 
-// loadKProbeUnwinders reuses large parts of loadPerfUnwinders. By default all eBPF programs
-// are written as perf event eBPF programs. loadKProbeUnwinders dynamically rewrites the
-// specification of these programs to kprobe eBPF programs and adjusts tail call maps.
-func loadKProbeUnwinders(coll *cebpf.CollectionSpec, ebpfProgs map[string]*cebpf.Program,
-	tailcallMap *cebpf.Map, tailCallProgs []progLoaderHelper,
-	bpfVerifierLogLevel uint32, perfTailCallMapFD int) error {
+// loadProbeUnwinders reuses large parts of loadPerfUnwinders. By default all eBPF programs
+// are written as perf event eBPF programs. loadProbeUnwinders dynamically rewrites the
+// specification of these programs to xProbe eBPF programs and adjusts tail call maps.
+func loadProbeUnwinders(coll *cebpf.CollectionSpec, ebpfProgs map[string]*cebpf.Program,
+	tailcallMap *cebpf.Map, progs []progLoaderHelper,
+	bpfVerifierLogLevel uint32, perfTailCallMapFD int,
+) error {
 	programOptions := cebpf.ProgramOptions{
 		LogLevel: cebpf.LogLevel(bpfVerifierLogLevel),
 	}
-
-	progs := make([]progLoaderHelper, len(tailCallProgs)+2)
-	copy(progs, tailCallProgs)
-	progs = append(progs,
-		progLoaderHelper{
-			name:             "finish_task_switch",
-			noTailCallTarget: true,
-			enable:           true,
-		},
-		progLoaderHelper{
-			name:             "tracepoint__sched_switch",
-			noTailCallTarget: true,
-			enable:           true,
-		},
-	)
 
 	for _, unwindProg := range progs {
 		if !unwindProg.enable {
@@ -707,7 +837,8 @@ func loadKProbeUnwinders(coll *cebpf.CollectionSpec, ebpfProgs map[string]*cebpf
 // loadProgram loads an eBPF program from progSpec and populates the related maps.
 func loadProgram(ebpfProgs map[string]*cebpf.Program, tailcallMap *cebpf.Map,
 	progID uint32, progSpec *cebpf.ProgramSpec, programOptions cebpf.ProgramOptions,
-	noTailCallTarget bool) error {
+	noTailCallTarget bool,
+) error {
 	restoreRlimit, err := rlimit.MaximizeMemlock()
 	if err != nil {
 		return fmt.Errorf("failed to adjust rlimit: %v", err)
@@ -722,12 +853,12 @@ func loadProgram(ebpfProgs map[string]*cebpf.Program, tailcallMap *cebpf.Map,
 		// so we print each line individually.
 		if ve, ok := err.(*cebpf.VerifierError); ok {
 			for _, line := range ve.Log {
-				log.Error(line)
+				log.Errorf("%s", line)
 			}
 		} else {
 			scanner := bufio.NewScanner(strings.NewReader(err.Error()))
 			for scanner.Scan() {
-				log.Error(scanner.Text())
+				log.Errorf("%s", scanner.Text())
 			}
 		}
 		return fmt.Errorf("failed to load %s", progSpec.Name)
@@ -748,87 +879,32 @@ func loadProgram(ebpfProgs map[string]*cebpf.Program, tailcallMap *cebpf.Map,
 	return nil
 }
 
-// insertKernelFrames fetches the kernel stack frames for a particular kstackID and populates
-// the trace with these kernel frames. It also allocates the memory for the frames of the trace.
-// It returns the number of kernel frames for kstackID or an error.
-func (t *Tracer) insertKernelFrames(trace *host.Trace, ustackLen uint32,
-	kstackID int32) (uint32, error) {
-	cKstackID := C.s32(kstackID)
-	kstackVal := make([]C.uint64_t, support.PerfMaxStackDepth)
-
-	if err := t.ebpfMaps["kernel_stackmap"].Lookup(unsafe.Pointer(&cKstackID),
-		unsafe.Pointer(&kstackVal[0])); err != nil {
-		return 0, fmt.Errorf("failed to lookup kernel frames for stackID %d: %v", kstackID, err)
+// symbolizeKernelFrames converts raw kernel addresses into symbolized frames.
+func (t *Tracer) symbolizeKernelFrames(addrs []uint64, oldFrames libpf.Frames) libpf.Frames {
+	frames := oldFrames
+	if len(addrs) > len(frames) {
+		frames = make(libpf.Frames, 0, len(addrs))
 	}
-
-	// The kernel returns absolute addresses in kernel address
-	// space format. Here just the stack length is needed.
-	// But also debug print the symbolization based on kallsyms.
-	var kstackLen uint32
-	for kstackLen < support.PerfMaxStackDepth && kstackVal[kstackLen] != 0 {
-		kstackLen++
+	for _, addr := range addrs {
+		address := libpf.Address(addr)
+		frame := libpf.Frame{
+			Type:            libpf.KernelFrame,
+			AddressOrLineno: libpf.AddressOrLineno(address - 1),
+		}
+		if funcName, offset, ok := t.kernelSymbolizer.LookupBPFSymbol(address); ok {
+			// BPF program: use address relative to symbol start for deduplication.
+			frame.AddressOrLineno = libpf.AddressOrLineno(offset)
+			frame.FunctionName = libpf.Intern(funcName)
+		} else if kmod, err := t.kernelSymbolizer.GetModuleByAddress(address); err == nil {
+			frame.Mapping = kmod.Mapping()
+			frame.AddressOrLineno -= libpf.AddressOrLineno(kmod.Start())
+			if funcName, _, err := kmod.LookupSymbolByAddress(address); err == nil {
+				frame.FunctionName = libpf.Intern(funcName)
+			}
+		}
+		frames.Append(&frame)
 	}
-
-	trace.Frames = make([]host.Frame, kstackLen+ustackLen)
-
-	var kernelSymbolCacheHit, kernelSymbolCacheMiss uint64
-
-	for i := uint32(0); i < kstackLen; i++ {
-		// Translate the kernel address into something that can be
-		// later symbolized. The address is made relative to
-		// matching module's ELF .text section:
-		//  - main image should have .text section at start of the code segment
-		//  - modules are ELF object files (.o) without program headers and
-		//    LOAD segments. the address is relative to the .text section
-		mod, addr, _ := t.kernelModules.LookupByAddress(
-			libpf.SymbolValue(kstackVal[i]))
-
-		fileID, foundFileID := t.moduleFileIDs[string(mod)]
-
-		if !foundFileID {
-			fileID = libpf.UnknownKernelFileID
-		}
-
-		hostFileID := host.FileIDFromLibpf(fileID)
-		t.processManager.FileIDMapper.Set(hostFileID, fileID)
-
-		trace.Frames[i] = host.Frame{
-			File:   hostFileID,
-			Lineno: libpf.AddressOrLineno(addr),
-			Type:   libpf.KernelFrame,
-
-			// For all kernel frames, the kernel unwinder will always produce a
-			// frame in which the RIP is after a call instruction (it hides the
-			// top frames that leads to the unwinder itself).
-			ReturnAddress: true,
-		}
-
-		if !foundFileID {
-			continue
-		}
-
-		// Kernel frame PCs need to be adjusted by -1. This duplicates logic done in the trace
-		// converter. This should be fixed with PF-1042.
-		frameID := libpf.NewFrameID(fileID, trace.Frames[i].Lineno-1)
-		if t.reporter.FrameKnown(frameID) {
-			kernelSymbolCacheHit++
-			continue
-		}
-		kernelSymbolCacheMiss++
-
-		if symbol, _, foundSymbol := t.kernelSymbols.LookupByAddress(
-			libpf.SymbolValue(kstackVal[i])); foundSymbol {
-			t.reporter.FrameMetadata(&reporter.FrameMetadataArgs{
-				FrameID:      frameID,
-				FunctionName: string(symbol),
-			})
-		}
-	}
-
-	t.fallbackSymbolMiss.Add(kernelSymbolCacheMiss)
-	t.fallbackSymbolHit.Add(kernelSymbolCacheHit)
-
-	return kstackLen, nil
+	return frames
 }
 
 // enableEvent removes the entry of given eventType from the inhibitEvents map
@@ -841,67 +917,34 @@ func (t *Tracer) enableEvent(eventType int) {
 	_ = inhibitEventsMap.Delete(unsafe.Pointer(&et))
 }
 
-// monitorPIDEventsMap periodically iterates over the eBPF map pid_events,
+// monitorPIDEventsMap iterates over the eBPF map pid_events in batches,
 // collects PIDs and writes them to the keys slice.
-func (t *Tracer) monitorPIDEventsMap(keys *[]uint32) {
+func (t *Tracer) monitorPIDEventsMap(keys *[]libpf.PIDTID) error {
 	eventsMap := t.ebpfMaps["pid_events"]
-	var key, nextKey uint32
-	var value bool
-	keyFound := true
-	deleteBatch := make(libpf.Set[uint32])
 
-	// Key 0 retrieves the very first element in the hash map as
-	// it is guaranteed not to exist in pid_events.
-	key = 0
-	if err := eventsMap.NextKey(unsafe.Pointer(&key), unsafe.Pointer(&nextKey)); err != nil {
+	removed := make([]uint64, 128)
+	values := make([]bool, len(removed))
+
+	cursor := cebpf.MapBatchCursor{}
+
+	for {
+		n, err := eventsMap.BatchLookupAndDelete(&cursor, removed, values, nil)
+
+		// There can be results even if there's an error.
+		for i := range n {
+			*keys = append(*keys, libpf.PIDTID(removed[i]))
+		}
+
 		if errors.Is(err, cebpf.ErrKeyNotExist) {
-			log.Debugf("Empty pid_events map")
-			return
-		}
-		log.Fatalf("Failed to read from pid_events map: %v", err)
-	}
-
-	for keyFound {
-		key = nextKey
-
-		if err := eventsMap.Lookup(unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
-			log.Fatalf("Failed to lookup '%v' in pid_events: %v", key, err)
+			break
 		}
 
-		// Lookup the next map entry before deleting the current one.
-		if err := eventsMap.NextKey(unsafe.Pointer(&key), unsafe.Pointer(&nextKey)); err != nil {
-			if !errors.Is(err, cebpf.ErrKeyNotExist) {
-				log.Fatalf("Failed to read from pid_events map: %v", err)
-			}
-			keyFound = false
-		}
-
-		if !t.hasBatchOperations {
-			// Now that we have the next key, we can delete the current one.
-			if err := eventsMap.Delete(unsafe.Pointer(&key)); err != nil {
-				log.Fatalf("Failed to delete '%v' from pid_events: %v", key, err)
-			}
-		} else {
-			// Store to-be-deleted keys in a map so we can delete them all with a single
-			// bpf syscall.
-			deleteBatch[key] = libpf.Void{}
-		}
-
-		// If we process keys inline with iteration (e.g. by sending them to t.pidEvents at this
-		// exact point), we may block sending to the channel, delay the iteration and may introduce
-		// race conditions (related to deletion). For that reason, keys are first collected and,
-		// after the iteration has finished, sent to the channel.
-		*keys = append(*keys, key)
-	}
-
-	keysToDelete := len(deleteBatch)
-	if keysToDelete != 0 {
-		keys := libpf.MapKeysToSlice(deleteBatch)
-		if _, err := eventsMap.BatchDelete(keys, nil); err != nil {
-			log.Fatalf("Failed to batch delete %d entries from pid_events map: %v",
-				keysToDelete, err)
+		if err != nil {
+			return fmt.Errorf("Failed to batch lookup and delete entries from pid_events map: %v", err)
 		}
 	}
+
+	return nil
 }
 
 // eBPFMetricsCollector retrieves the eBPF metrics, calculates their delta values,
@@ -909,7 +952,8 @@ func (t *Tracer) monitorPIDEventsMap(keys *[]uint32) {
 // Returns a slice of Metric ID/Value pairs.
 func (t *Tracer) eBPFMetricsCollector(
 	translateIDs []metrics.MetricID,
-	previousMetricValue []metrics.MetricValue) []metrics.Metric {
+	previousMetricValue []metrics.MetricValue,
+) []metrics.Metric {
 	metricsMap := t.ebpfMaps["metrics"]
 	metricsUpdates := make([]metrics.Metric, 0, len(translateIDs))
 
@@ -959,208 +1003,127 @@ func (t *Tracer) eBPFMetricsCollector(
 	return metricsUpdates
 }
 
+// Various bpf trace handling related errors:
+var (
+	errRecordTooSmall       = errors.New("trace record too small")
+	errRecordUnexpectedSize = errors.New("unexpected record size")
+	errOriginUnexpected     = errors.New("unexpected origin")
+)
+
 // loadBpfTrace parses a raw BPF trace into a `host.Trace` instance.
-//
-// If the raw trace contains a kernel stack ID, the kernel stack is also
-// retrieved and inserted at the appropriate position.
-func (t *Tracer) loadBpfTrace(raw []byte, cpu int) *host.Trace {
-	frameListOffs := int(unsafe.Offsetof(C.Trace{}.frames))
+func (t *Tracer) loadBpfTrace(raw []byte) (*libpf.EbpfTrace, error) {
+	frameListOffs := int(unsafe.Offsetof(support.Trace{}.Frame_data))
 
 	if len(raw) < frameListOffs {
-		panic("trace record too small")
+		return nil, fmt.Errorf("%d < %d: %w", len(raw), frameListOffs, errRecordTooSmall)
 	}
 
-	frameSize := int(unsafe.Sizeof(C.Frame{}))
-	ptr := (*C.Trace)(unsafe.Pointer(unsafe.SliceData(raw)))
+	ptr := traceFromRaw(raw)
+	frameDataLen := int(ptr.Frame_data_len) * 8
 
 	// NOTE: can't do exact check here: kernel adds a few padding bytes to messages.
-	if len(raw) < frameListOffs+int(ptr.stack_len)*frameSize {
-		panic("unexpected record size")
+	if len(raw) < frameListOffs+frameDataLen {
+		return nil, fmt.Errorf("%d < %d: %w", len(raw), frameListOffs+frameDataLen,
+			errRecordUnexpectedSize)
 	}
 
-	pid := libpf.PID(ptr.pid)
-	trace := &host.Trace{
-		Comm:             C.GoString((*C.char)(unsafe.Pointer(&ptr.comm))),
-		ExecutablePath:   t.processManager.ExePathForPID(pid),
-		ProcessName:      t.processManager.NameForPID(pid),
-		APMTraceID:       *(*libpf.APMTraceID)(unsafe.Pointer(&ptr.apm_trace_id)),
-		APMTransactionID: *(*libpf.APMTransactionID)(unsafe.Pointer(&ptr.apm_transaction_id)),
+	pid := libpf.PID(ptr.Pid)
+	procMeta := t.processManager.MetaForPID(pid)
+	trace := t.tracePool.Get().(*libpf.EbpfTrace)
+	*trace = libpf.EbpfTrace{
+		Comm:             goString(ptr.Comm[:]),
+		ExecutablePath:   procMeta.Executable,
+		ContainerID:      procMeta.ContainerID,
+		ProcessName:      procMeta.Name,
+		APMTraceID:       *(*libpf.APMTraceID)(unsafe.Pointer(&ptr.Apm_trace_id)),
+		APMTransactionID: *(*libpf.APMTransactionID)(unsafe.Pointer(&ptr.Apm_transaction_id)),
 		PID:              pid,
-		TID:              libpf.PID(ptr.tid),
-		Origin:           libpf.Origin(ptr.origin),
-		OffTime:          int64(ptr.offtime),
-		KTime:            times.KTime(ptr.ktime),
-		CPU:              cpu,
+		TID:              libpf.PID(ptr.Tid),
+		Origin:           libpf.Origin(ptr.Origin),
+		Value:            int64(ptr.Value),
+		KTime:            int64(ptr.Ktime),
+		CpuID:            ptr.Cpu_id,
+		EnvVars:          procMeta.EnvVariables,
 	}
 
-	if trace.Origin != support.TraceOriginSampling && trace.Origin != support.TraceOriginOffCPU {
-		log.Warnf("Skip handling trace from unexpected %d origin", trace.Origin)
-		return nil
+	switch trace.Origin {
+	case support.TraceOriginSampling:
+	case support.TraceOriginOffCPU:
+	case support.TraceOriginProbe:
+	default:
+		return nil, fmt.Errorf("origin %d: %w", trace.Origin, errOriginUnexpected)
 	}
 
-	// Trace fields included in the hash:
-	//  - PID, kernel stack ID, length & frame array
-	// Intentionally excluded:
-	//  - ktime, COMM, APM trace, APM transaction ID, Origin and Off Time
-	ptr.comm = [16]C.char{}
-	ptr.apm_trace_id = C.ApmTraceID{}
-	ptr.apm_transaction_id = C.ApmSpanID{}
-	ptr.ktime = 0
-	ptr.origin = 0
-	ptr.offtime = 0
-	trace.Hash = host.TraceHash(xxh3.Hash128(raw).Lo)
-
-	userFrameOffs := 0
-	if ptr.kernel_stack_id >= 0 {
-		kstackLen, err := t.insertKernelFrames(
-			trace, uint32(ptr.stack_len), int32(ptr.kernel_stack_id))
-
-		if err != nil {
-			log.Errorf("Failed to get kernel stack frames for 0x%x: %v", trace.Hash, err)
-		} else {
-			userFrameOffs = int(kstackLen)
+	if ptr.Custom_labels.Len > 0 {
+		trace.CustomLabels = make(map[libpf.String]libpf.String, int(ptr.Custom_labels.Len))
+		for i := 0; i < int(ptr.Custom_labels.Len); i++ {
+			lbl := ptr.Custom_labels.Labels[i]
+			key := goString(lbl.Key[:])
+			val := goString(lbl.Val[:])
+			trace.CustomLabels[key] = val
 		}
 	}
 
-	// If there are no kernel frames, or reading them failed, we are responsible
-	// for allocating the columnar frame array.
-	if len(trace.Frames) == 0 {
-		trace.Frames = make([]host.Frame, ptr.stack_len)
-	}
+	trace.NumFrames = ptr.Num_frames
 
-	for i := 0; i < int(ptr.stack_len); i++ {
-		rawFrame := &ptr.frames[i]
-		trace.Frames[userFrameOffs+i] = host.Frame{
-			File:          host.FileID(rawFrame.file_id),
-			Lineno:        libpf.AddressOrLineno(rawFrame.addr_or_line),
-			Type:          libpf.FrameType(rawFrame.kind),
-			ReturnAddress: rawFrame.return_address != 0,
-		}
+	// Symbolize kernel frames directly from the raw BPF data before copying
+	// userspace frame data, so we only copy what's needed.
+	numKernelFrames := int(ptr.Num_kernel_frames)
+	if numKernelFrames > 0 {
+		trace.KernelFrames = t.symbolizeKernelFrames(
+			ptr.Frame_data[:numKernelFrames], trace.KernelFrames)
 	}
+	userFrameLen := int(ptr.Frame_data_len) - numKernelFrames
+	trace.FrameData = trace.FrameDataBuf[:userFrameLen]
+	copy(trace.FrameData, ptr.Frame_data[numKernelFrames:ptr.Frame_data_len])
 
-	return trace
+	return trace, nil
 }
 
 // StartMapMonitors starts goroutines for collecting metrics and monitoring eBPF
 // maps for tracepoints, new traces, trace count updates and unknown PCs.
-func (t *Tracer) StartMapMonitors(ctx context.Context, traceOutChan chan *host.Trace) error {
-	eventMetricCollector := t.startEventMonitor(ctx)
+func (t *Tracer) StartMapMonitors(ctx context.Context, traceOutChan chan<- *libpf.EbpfTrace) error {
+	onlineCPUs, err := onlineCPUsOnce()
+	if err != nil {
+		return fmt.Errorf("failed to get online cpus: %w", err)
+	}
 
-	startPollingPerfEventMonitor(ctx, t.ebpfMaps["trace_events"], t.intervals.TracePollInterval(),
-		t.samplesPerSecond*int(unsafe.Sizeof(C.Trace{})), func(rawTrace []byte, cpu int) {
-			traceOutChan <- t.loadBpfTrace(rawTrace, cpu)
-		})
+	if err := t.kernelSymbolizer.StartMonitor(ctx, onlineCPUs); err != nil {
+		log.Warnf("Failed to start kallsyms monitor: %v", err)
+	}
+	eventMetricCollector, err := t.startEventMonitor(ctx)
+	if err != nil {
+		return err
+	}
+	traceEventMetricCollector, err := t.startTraceEventMonitor(ctx, traceOutChan)
+	if err != nil {
+		return err
+	}
 
-	pidEvents := make([]uint32, 0)
+	pidEvents := make([]libpf.PIDTID, 0)
 	periodiccaller.StartWithManualTrigger(ctx, t.intervals.MonitorInterval(),
-		t.triggerPIDProcessing, func(_ bool) {
+		t.triggerPIDProcessing, func(_ bool) bool {
 			t.enableEvent(support.EventTypeGenericPID)
-			t.monitorPIDEventsMap(&pidEvents)
+			err := t.monitorPIDEventsMap(&pidEvents)
+			if err != nil {
+				log.Errorf("Failed to monitor PID events: %v", err)
+				t.signalDone()
+				return false
+			}
 
-			for _, ev := range pidEvents {
-				log.Debugf("=> PID: %v", ev)
-				t.pidEvents <- libpf.PID(ev)
+			for _, pidTid := range pidEvents {
+				log.Debugf("=> %v", pidTid)
+				t.pidEvents <- pidTid
 			}
 
 			// Keep the underlying array alive to avoid GC pressure
 			pidEvents = pidEvents[:0]
+			return true
 		})
 
 	// translateIDs is a translation table for eBPF IDs into Metric IDs.
 	// Index is the ebpfID, value is the corresponding metricID.
-	//nolint:lll
-	translateIDs := []metrics.MetricID{
-		C.metricID_UnwindCallInterpreter:                      metrics.IDUnwindCallInterpreter,
-		C.metricID_UnwindErrZeroPC:                            metrics.IDUnwindErrZeroPC,
-		C.metricID_UnwindErrStackLengthExceeded:               metrics.IDUnwindErrStackLengthExceeded,
-		C.metricID_UnwindErrBadTSDAddr:                        metrics.IDUnwindErrBadTLSAddr,
-		C.metricID_UnwindErrBadTPBaseAddr:                     metrics.IDUnwindErrBadTPBaseAddr,
-		C.metricID_UnwindNativeAttempts:                       metrics.IDUnwindNativeAttempts,
-		C.metricID_UnwindNativeFrames:                         metrics.IDUnwindNativeFrames,
-		C.metricID_UnwindNativeStackDeltaStop:                 metrics.IDUnwindNativeStackDeltaStop,
-		C.metricID_UnwindNativeErrLookupTextSection:           metrics.IDUnwindNativeErrLookupTextSection,
-		C.metricID_UnwindNativeErrLookupIterations:            metrics.IDUnwindNativeErrLookupIterations,
-		C.metricID_UnwindNativeErrLookupRange:                 metrics.IDUnwindNativeErrLookupRange,
-		C.metricID_UnwindNativeErrKernelAddress:               metrics.IDUnwindNativeErrKernelAddress,
-		C.metricID_UnwindNativeErrWrongTextSection:            metrics.IDUnwindNativeErrWrongTextSection,
-		C.metricID_UnwindNativeErrPCRead:                      metrics.IDUnwindNativeErrPCRead,
-		C.metricID_UnwindPythonAttempts:                       metrics.IDUnwindPythonAttempts,
-		C.metricID_UnwindPythonFrames:                         metrics.IDUnwindPythonFrames,
-		C.metricID_UnwindPythonErrBadPyThreadStateCurrentAddr: metrics.IDUnwindPythonErrBadPyThreadStateCurrentAddr,
-		C.metricID_UnwindPythonErrZeroThreadState:             metrics.IDUnwindPythonErrZeroThreadState,
-		C.metricID_UnwindPythonErrBadThreadStateFrameAddr:     metrics.IDUnwindPythonErrBadThreadStateFrameAddr,
-		C.metricID_UnwindPythonZeroFrameCodeObject:            metrics.IDUnwindPythonZeroFrameCodeObject,
-		C.metricID_UnwindPythonErrBadCodeObjectArgCountAddr:   metrics.IDUnwindPythonErrBadCodeObjectArgCountAddr,
-		C.metricID_UnwindNativeErrStackDeltaInvalid:           metrics.IDUnwindNativeErrStackDeltaInvalid,
-		C.metricID_ErrEmptyStack:                              metrics.IDErrEmptyStack,
-		C.metricID_UnwindHotspotAttempts:                      metrics.IDUnwindHotspotAttempts,
-		C.metricID_UnwindHotspotFrames:                        metrics.IDUnwindHotspotFrames,
-		C.metricID_UnwindHotspotErrNoCodeblob:                 metrics.IDUnwindHotspotErrNoCodeblob,
-		C.metricID_UnwindHotspotErrInvalidCodeblob:            metrics.IDUnwindHotspotErrInvalidCodeblob,
-		C.metricID_UnwindHotspotErrInterpreterFP:              metrics.IDUnwindHotspotErrInterpreterFP,
-		C.metricID_UnwindHotspotErrLrUnwindingMidTrace:        metrics.IDUnwindHotspotErrLrUnwindingMidTrace,
-		C.metricID_UnwindHotspotUnsupportedFrameSize:          metrics.IDHotspotUnsupportedFrameSize,
-		C.metricID_UnwindNativeSmallPC:                        metrics.IDUnwindNativeSmallPC,
-		C.metricID_UnwindNativeErrLookupStackDeltaInnerMap:    metrics.IDUnwindNativeErrLookupStackDeltaInnerMap,
-		C.metricID_UnwindNativeErrLookupStackDeltaOuterMap:    metrics.IDUnwindNativeErrLookupStackDeltaOuterMap,
-		C.metricID_ErrBPFCurrentComm:                          metrics.IDErrBPFCurrentComm,
-		C.metricID_UnwindPHPAttempts:                          metrics.IDUnwindPHPAttempts,
-		C.metricID_UnwindPHPFrames:                            metrics.IDUnwindPHPFrames,
-		C.metricID_UnwindPHPErrBadCurrentExecuteData:          metrics.IDUnwindPHPErrBadCurrentExecuteData,
-		C.metricID_UnwindPHPErrBadZendExecuteData:             metrics.IDUnwindPHPErrBadZendExecuteData,
-		C.metricID_UnwindPHPErrBadZendFunction:                metrics.IDUnwindPHPErrBadZendFunction,
-		C.metricID_UnwindPHPErrBadZendOpline:                  metrics.IDUnwindPHPErrBadZendOpline,
-		C.metricID_UnwindRubyAttempts:                         metrics.IDUnwindRubyAttempts,
-		C.metricID_UnwindRubyFrames:                           metrics.IDUnwindRubyFrames,
-		C.metricID_UnwindPerlAttempts:                         metrics.IDUnwindPerlAttempts,
-		C.metricID_UnwindPerlFrames:                           metrics.IDUnwindPerlFrames,
-		C.metricID_UnwindPerlTSD:                              metrics.IDUnwindPerlTLS,
-		C.metricID_UnwindPerlReadStackInfo:                    metrics.IDUnwindPerlReadStackInfo,
-		C.metricID_UnwindPerlReadContextStackEntry:            metrics.IDUnwindPerlReadContextStackEntry,
-		C.metricID_UnwindPerlResolveEGV:                       metrics.IDUnwindPerlResolveEGV,
-		C.metricID_UnwindHotspotErrInvalidRA:                  metrics.IDUnwindHotspotErrInvalidRA,
-		C.metricID_UnwindV8Attempts:                           metrics.IDUnwindV8Attempts,
-		C.metricID_UnwindV8Frames:                             metrics.IDUnwindV8Frames,
-		C.metricID_UnwindV8ErrBadFP:                           metrics.IDUnwindV8ErrBadFP,
-		C.metricID_UnwindV8ErrBadJSFunc:                       metrics.IDUnwindV8ErrBadJSFunc,
-		C.metricID_UnwindV8ErrBadCode:                         metrics.IDUnwindV8ErrBadCode,
-		C.metricID_ReportedPIDsErr:                            metrics.IDReportedPIDsErr,
-		C.metricID_PIDEventsErr:                               metrics.IDPIDEventsErr,
-		C.metricID_UnwindNativeLr0:                            metrics.IDUnwindNativeLr0,
-		C.metricID_NumProcNew:                                 metrics.IDNumProcNew,
-		C.metricID_NumProcExit:                                metrics.IDNumProcExit,
-		C.metricID_NumUnknownPC:                               metrics.IDNumUnknownPC,
-		C.metricID_NumGenericPID:                              metrics.IDNumGenericPID,
-		C.metricID_UnwindPythonErrBadCFrameFrameAddr:          metrics.IDUnwindPythonErrBadCFrameFrameAddr,
-		C.metricID_MaxTailCalls:                               metrics.IDMaxTailCalls,
-		C.metricID_UnwindPythonErrNoProcInfo:                  metrics.IDUnwindPythonErrNoProcInfo,
-		C.metricID_UnwindPythonErrBadAutoTlsKeyAddr:           metrics.IDUnwindPythonErrBadAutoTlsKeyAddr,
-		C.metricID_UnwindPythonErrReadThreadStateAddr:         metrics.IDUnwindPythonErrReadThreadStateAddr,
-		C.metricID_UnwindPythonErrReadTsdBase:                 metrics.IDUnwindPythonErrReadTsdBase,
-		C.metricID_UnwindRubyErrNoProcInfo:                    metrics.IDUnwindRubyErrNoProcInfo,
-		C.metricID_UnwindRubyErrReadStackPtr:                  metrics.IDUnwindRubyErrReadStackPtr,
-		C.metricID_UnwindRubyErrReadStackSize:                 metrics.IDUnwindRubyErrReadStackSize,
-		C.metricID_UnwindRubyErrReadCfp:                       metrics.IDUnwindRubyErrReadCfp,
-		C.metricID_UnwindRubyErrReadEp:                        metrics.IDUnwindRubyErrReadEp,
-		C.metricID_UnwindRubyErrReadIseqBody:                  metrics.IDUnwindRubyErrReadIseqBody,
-		C.metricID_UnwindRubyErrReadIseqEncoded:               metrics.IDUnwindRubyErrReadIseqEncoded,
-		C.metricID_UnwindRubyErrReadIseqSize:                  metrics.IDUnwindRubyErrReadIseqSize,
-		C.metricID_UnwindNativeErrLrUnwindingMidTrace:         metrics.IDUnwindNativeErrLrUnwindingMidTrace,
-		C.metricID_UnwindNativeErrReadKernelModeRegs:          metrics.IDUnwindNativeErrReadKernelModeRegs,
-		C.metricID_UnwindNativeErrChaseIrqStackLink:           metrics.IDUnwindNativeErrChaseIrqStackLink,
-		C.metricID_UnwindV8ErrNoProcInfo:                      metrics.IDUnwindV8ErrNoProcInfo,
-		C.metricID_UnwindNativeErrBadUnwindInfoIndex:          metrics.IDUnwindNativeErrBadUnwindInfoIndex,
-		C.metricID_UnwindApmIntErrReadTsdBase:                 metrics.IDUnwindApmIntErrReadTsdBase,
-		C.metricID_UnwindApmIntErrReadCorrBufPtr:              metrics.IDUnwindApmIntErrReadCorrBufPtr,
-		C.metricID_UnwindApmIntErrReadCorrBuf:                 metrics.IDUnwindApmIntErrReadCorrBuf,
-		C.metricID_UnwindApmIntReadSuccesses:                  metrics.IDUnwindApmIntReadSuccesses,
-		C.metricID_UnwindDotnetAttempts:                       metrics.IDUnwindDotnetAttempts,
-		C.metricID_UnwindDotnetFrames:                         metrics.IDUnwindDotnetFrames,
-		C.metricID_UnwindDotnetErrNoProcInfo:                  metrics.IDUnwindDotnetErrNoProcInfo,
-		C.metricID_UnwindDotnetErrBadFP:                       metrics.IDUnwindDotnetErrBadFP,
-		C.metricID_UnwindDotnetErrCodeHeader:                  metrics.IDUnwindDotnetErrCodeHeader,
-		C.metricID_UnwindDotnetErrCodeTooLarge:                metrics.IDUnwindDotnetErrCodeTooLarge,
-	}
+	translateIDs := support.MetricsTranslation
 
 	// previousMetricValue stores the previously retrieved metric values to
 	// calculate and store delta values.
@@ -1168,21 +1131,23 @@ func (t *Tracer) StartMapMonitors(ctx context.Context, traceOutChan chan *host.T
 
 	periodiccaller.Start(ctx, t.intervals.MonitorInterval(), func() {
 		metrics.AddSlice(eventMetricCollector())
+		metrics.AddSlice(traceEventMetricCollector())
 		metrics.AddSlice(t.eBPFMetricsCollector(translateIDs, previousMetricValue))
-
-		metrics.AddSlice([]metrics.Metric{
-			{
-				ID:    metrics.IDKernelFallbackSymbolLRUHit,
-				Value: metrics.MetricValue(t.fallbackSymbolHit.Swap(0)),
-			},
-			{
-				ID:    metrics.IDKernelFallbackSymbolLRUMiss,
-				Value: metrics.MetricValue(t.fallbackSymbolMiss.Swap(0)),
-			},
-		})
 	})
 
 	return nil
+}
+
+// terminatePerfEvents disables perf events and closes their file descriptor.
+func terminatePerfEvents(events []*perf.Event) {
+	for _, event := range events {
+		if err := event.Disable(); err != nil {
+			log.Errorf("Failed to disable perf event: %v", err)
+		}
+		if err := event.Close(); err != nil {
+			log.Errorf("Failed to close perf event: %v", err)
+		}
+	}
 }
 
 // AttachTracer attaches the main tracer entry point to the perf interrupt events. The tracer
@@ -1200,23 +1165,26 @@ func (t *Tracer) AttachTracer() error {
 		return fmt.Errorf("failed to configure software perf event: %v", err)
 	}
 
-	onlineCPUIDs, err := getOnlineCPUIDs()
+	onlineCPUs, err := onlineCPUsOnce()
 	if err != nil {
-		return fmt.Errorf("failed to get online CPUs: %v", err)
+		return fmt.Errorf("failed to get online cpus: %w", err)
 	}
 
 	events := t.perfEntrypoints.WLock()
 	defer t.perfEntrypoints.WUnlock(&events)
-	for _, id := range onlineCPUIDs {
+	for _, id := range onlineCPUs {
 		perfEvent, err := perf.Open(perfAttribute, perf.AllThreads, id, nil)
 		if err != nil {
+			terminatePerfEvents(*events)
 			return fmt.Errorf("failed to attach to perf event on CPU %d: %v", id, err)
 		}
 		if err := perfEvent.SetBPF(uint32(tracerProg.FD())); err != nil {
+			terminatePerfEvents(*events)
 			return fmt.Errorf("failed to attach eBPF program to perf event: %v", err)
 		}
 		*events = append(*events, perfEvent)
 	}
+
 	return nil
 }
 
@@ -1241,8 +1209,9 @@ func (t *Tracer) EnableProfiling() error {
 // time interval. Otherwise the frequency based sampling events are disabled.
 func (t *Tracer) probabilisticProfile(interval time.Duration, threshold uint) {
 	enableSampling := false
-	var probProfilingStatus = probProfilingDisable
+	probProfilingStatus := probProfilingDisable
 
+	//nolint:gosec
 	if rand.UintN(ProbabilisticThresholdMax) < threshold {
 		enableSampling = true
 		probProfilingStatus = probProfilingEnable
@@ -1301,16 +1270,32 @@ func (t *Tracer) StartOffCPUProfiling() error {
 		return errors.New("off-cpu program finish_task_switch is not available")
 	}
 
-	kprobeSymbol, err := t.kernelSymbols.LookupSymbolByPrefix("finish_task_switch")
-	if err != nil {
-		return errors.New("failed to find kernel symbol for finish_task_switch")
-	}
-
-	kprobeLink, err := link.Kprobe(string(kprobeSymbol.Name), kprobeProg, nil)
+	kmod, err := t.kernelSymbolizer.GetModuleByName(kallsyms.Kernel)
 	if err != nil {
 		return err
 	}
-	t.hooks[hookPoint{group: "kprobe", name: "finish_task_switch"}] = kprobeLink
+
+	hookSymbolPrefix := "finish_task_switch"
+	kprobeSymbs := kmod.LookupSymbolsByPrefix(hookSymbolPrefix)
+	if len(kprobeSymbs) == 0 {
+		return errors.New("no finish_task_switch symbols found")
+	}
+
+	attached := false
+	// Attach to all symbols with the prefix finish_task_switch.
+	for _, symb := range kprobeSymbs {
+		kprobeLink, linkErr := link.Kprobe(string(symb.Name), kprobeProg, nil)
+		if linkErr != nil {
+			log.Warnf("Failed to attach to %s: %v", symb.Name, linkErr)
+			continue
+		}
+		attached = true
+		t.hooks[hookPoint{group: "kprobe", name: string(symb.Name)}] = kprobeLink
+	}
+	if !attached {
+		return fmt.Errorf("failed to attach to one of %d symbols with prefix '%s'",
+			len(kprobeSymbs), hookSymbolPrefix)
+	}
 
 	// Attach the first hook that enables off-cpu profiling.
 	tpProg, ok := t.ebpfProgs["tracepoint__sched_switch"]
@@ -1326,7 +1311,32 @@ func (t *Tracer) StartOffCPUProfiling() error {
 	return nil
 }
 
-// TraceProcessor gets the trace processor.
-func (t *Tracer) TraceProcessor() tracehandler.TraceProcessor {
-	return t.processManager
+func (t *Tracer) AttachProbes(probes []string) error {
+	for _, probeStr := range probes {
+		probeSpec, err := ParseProbe(probeStr)
+		if err != nil {
+			return err
+		}
+
+		uProbeProg, ok := t.ebpfProgs[probeSpec.ProgName]
+		if !ok {
+			return fmt.Errorf("%s is not available", probeSpec.ProgName)
+		}
+
+		probeLink, err := AttachProbe(uProbeProg, probeSpec)
+		if err != nil {
+			return err
+		}
+
+		t.hooks[hookPoint{group: probeSpec.Type.String(), name: probeStr}] = probeLink
+	}
+	return nil
+}
+
+func (t *Tracer) HandleTrace(bpfTrace *libpf.EbpfTrace) {
+	t.processManager.HandleTrace(bpfTrace)
+
+	// Reclaim the EbpfTrace
+	bpfTrace.KernelFrames = bpfTrace.KernelFrames[0:0]
+	t.tracePool.Put(bpfTrace)
 }

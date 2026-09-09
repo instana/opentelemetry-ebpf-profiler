@@ -14,6 +14,7 @@ import (
 
 	"go.opentelemetry.io/ebpf-profiler/host"
 	"go.opentelemetry.io/ebpf-profiler/rlimit"
+	"go.opentelemetry.io/ebpf-profiler/support"
 
 	"github.com/stretchr/testify/require"
 )
@@ -21,32 +22,21 @@ import (
 func prepareMapInMap(t *testing.T) *ebpf.Map {
 	t.Helper()
 
+	coll, err := support.LoadCollectionSpec()
+	require.NoError(t, err)
+	outerMapSpec := coll.Maps["exe_id_to_8_stack_deltas"]
+
 	restoreRlimit, err := rlimit.MaximizeMemlock()
 	require.NoError(t, err)
 	defer restoreRlimit()
 
-	outerMapSpec := ebpf.MapSpec{
-		Name:       "outer_map",
-		Type:       ebpf.HashOfMaps,
-		KeySize:    8,
-		ValueSize:  4,
-		MaxEntries: 3,
-		InnerMap: &ebpf.MapSpec{
-			Name:       "inner_map",
-			Type:       ebpf.Hash,
-			KeySize:    8,
-			ValueSize:  4,
-			MaxEntries: 3,
-		},
-	}
-
-	outerMap, err := ebpf.NewMap(&outerMapSpec)
+	outerMap, err := ebpf.NewMap(outerMapSpec)
 	require.NoError(t, err)
 	return outerMap
 }
 
 func TestAsyncMapUpdaterPool(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	amup := newAsyncMapUpdaterPool(ctx, updatePoolWorkers, updatePoolQueueCap)
@@ -60,7 +50,7 @@ func TestAsyncMapUpdaterPool(t *testing.T) {
 		require.Nil(t, r)
 	}()
 
-	g, _ := errgroup.WithContext(context.Background())
+	g, _ := errgroup.WithContext(ctx)
 	// For every worker start a Go routine that tries to send updates.
 	for i := 0; i < updatePoolWorkers; i++ {
 		g.Go(func() error {

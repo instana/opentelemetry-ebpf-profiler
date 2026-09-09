@@ -8,13 +8,15 @@ package elfunwindinfo // import "go.opentelemetry.io/ebpf-profiler/nativeunwind/
 // can be taken into account regardless of the target build platform.
 
 import (
+	"bytes"
 	"debug/elf"
 	"fmt"
 
 	sdtypes "go.opentelemetry.io/ebpf-profiler/nativeunwind/stackdeltatypes"
+	"go.opentelemetry.io/ebpf-profiler/support"
+	"golang.org/x/arch/arm64/arm64asm"
 )
 
-//nolint:deadcode,varcheck
 const (
 	// Aarch64 ABI
 	armRegX0  uleb128 = 0
@@ -117,10 +119,10 @@ func (regs *vmRegs) getUnwindInfoARM() sdtypes.UnwindInfo {
 	// are used for CFA.
 	switch regs.cfa.reg {
 	case armRegFP:
-		info.Opcode = sdtypes.UnwindOpcodeBaseFP
+		info.BaseReg = support.UnwindRegFp
 		info.Param = int32(regs.cfa.off)
 	case armRegSP:
-		info.Opcode = sdtypes.UnwindOpcodeBaseSP
+		info.BaseReg = support.UnwindRegSp
 		info.Param = int32(regs.cfa.off)
 	}
 
@@ -136,27 +138,54 @@ func (regs *vmRegs) getUnwindInfoARM() sdtypes.UnwindInfo {
 		// 2) the link register is restored from the stack (one can assume it is
 		//    valid for a sequence of instructions in the function prolog - prior to
 		//    the ret instruction itself)
-		// thus, the assumption - use UnwindOpcodeBaseLR to instruct native stack
-		// unwinder to load RA from link register
+		// thus, the assumption - use UnwindRegLr to instruct native stack unwinder
+		// to load RA from link register
 		// This is either prolog or epilog sequence, read RA from link register.
-		info.FPOpcode = sdtypes.UnwindOpcodeBaseLR
-		info.FPParam = 0
+		info.AuxBaseReg = support.UnwindRegLr
+		info.AuxParam = 0
 	case regCFA:
-		if regs.cfa.off != 0 {
-			// In ARM64, nothing can be assumed regarding RA location, it is
-			// simply somewhere on the stack, its detailed location needs to
-			// be extracted from FDE record.
-			// In our approach, RA offset part of stack delta always points
-			// to RA location  no matter whether CFA is evaluated with respect
-			// to SP or FP.
-			// Use same opcode as for CFA:
-			info.FPOpcode = info.Opcode
-			// Convert CFA base to SP / FP base in order to keep
-			// offset to RA from frame bottom (FP based heuristic).
-			// CFA offset needs to be added to the one denoting RA location.
-			info.FPParam = int32(regs.cfa.off) + int32(regs.ra.off)
-		}
+		info.AuxBaseReg = support.UnwindRegCfa
+		info.AuxParam = int32(regs.ra.off)
+	}
+	if regs.ra.reg != regSame && regs.fp.reg == regs.ra.reg && regs.fp.off+8 == regs.ra.off {
+		info.Flags |= support.UnwindFlagFrame
 	}
 
 	return info
+}
+
+func detectEntryARM(code []byte) int {
+	// Refer to test cases for the seen assembly dumps.
+	// Both, on GLIBC and MUSL there is no FDE for the entry code. This code tries
+	// to match both. The main difference is that glibc uses BL (Branch with Link)
+	// or a proper function call to maintain frame, and musl uses B (Branch) or
+	// a jump so the entry is not seen on traces.
+
+	// Match the prolog for clearing LR/FP
+	if len(code) < 32 ||
+		!bytes.Equal(code[:8], []byte{0x1d, 0x00, 0x80, 0xd2, 0x1e, 0x00, 0x80, 0xd2}) {
+		return 0
+	}
+
+	// Search for the second B or BL
+	numBranch := 0
+	for pos := 8; pos < len(code); pos += 4 {
+		inst, err := arm64asm.Decode(code[pos:])
+		if err != nil {
+			return 0
+		}
+		switch inst.Op {
+		case arm64asm.ADD, arm64asm.ADRP, arm64asm.AND, arm64asm.LDR,
+			arm64asm.MOV, arm64asm.MOVK, arm64asm.MOVZ:
+			// nop, allowed instruction
+		case arm64asm.B, arm64asm.BL:
+			numBranch++
+			if numBranch == 2 {
+				return pos + 4
+			}
+		default:
+			return 0
+		}
+	}
+	return 0
 }

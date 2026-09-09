@@ -6,7 +6,6 @@ package elfunwindinfo // import "go.opentelemetry.io/ebpf-profiler/nativeunwind/
 import (
 	"debug/elf"
 	"fmt"
-	"sort"
 	"strings"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
@@ -27,6 +26,13 @@ type extractionFilter struct {
 	// should be excluded from .eh_frame extraction.
 	start, end uintptr
 
+	// entryStart and entryEnd contain the virtual address for the entry
+	// stub code with synthesized stack deltas.
+	entryStart, entryEnd uintptr
+
+	// entryPending is true if the entry stub stack delta has not been added.
+	entryPending bool
+
 	// ehFrames is true if .eh_frame stack deltas are found
 	ehFrames bool
 
@@ -39,23 +45,47 @@ type extractionFilter struct {
 
 var _ ehframeHooks = &extractionFilter{}
 
+// addEntryDeltas generates the entry stub stack deltas.
+func (f *extractionFilter) addEntryDeltas(deltas *sdtypes.StackDeltaArray) {
+	deltas.AddEx(sdtypes.StackDelta{
+		Address: uint64(f.entryStart),
+		Hints:   sdtypes.UnwindHintKeep,
+		Info:    sdtypes.UnwindInfoStop,
+	}, !f.unsortedFrames)
+	deltas.Add(sdtypes.StackDelta{
+		Address: uint64(f.entryEnd),
+		Info:    sdtypes.UnwindInfoInvalid,
+	})
+	f.ehFrames = true
+	f.entryPending = false
+}
+
+func (f *extractionFilter) fdeUnsorted() {
+	f.unsortedFrames = true
+}
+
 // fdeHook filters out .eh_frame data that is superseded by .gopclntab data
-func (f *extractionFilter) fdeHook(_ *cieInfo, fde *fdeInfo) bool {
-	if !fde.sorted {
-		// Seems .debug_frame sometimes has broken FDEs for zero address
-		if fde.ipStart == 0 {
-			return false
-		}
-		f.unsortedFrames = true
+func (f *extractionFilter) fdeHook(_ *cieInfo, fde *fdeInfo, deltas *sdtypes.StackDeltaArray) bool {
+	// Drop FDEs inside the gopclntab area
+	if f.start <= fde.ipStart && fde.ipStart+fde.ipLen <= f.end {
+		return false
 	}
-	// Parse functions outside the gopclntab area
-	if fde.ipStart < f.start || fde.ipStart > f.end {
-		// This is here to set the flag only when we have collected at least
-		// one stack delta from the relevant source.
-		f.ehFrames = true
-		return true
+	// Seems .debug_frame sometimes has broken FDEs for zero address
+	if f.unsortedFrames && fde.ipStart == 0 {
+		return false
 	}
-	return false
+	// Insert entry stub deltas to their sorted position.
+	if f.entryPending && fde.ipStart >= f.entryStart {
+		f.addEntryDeltas(deltas)
+	}
+	// Drop FDEs overlapping with the detected entry stub.
+	if fde.ipStart+fde.ipLen > f.entryStart && f.entryEnd >= fde.ipStart {
+		return false
+	}
+	// This is here to set the flag only when we have collected at least
+	// one stack delta from the relevant source.
+	f.ehFrames = true
+	return true
 }
 
 // deltaHook is a stub to satisfy ehframeHooks interface
@@ -85,24 +115,25 @@ type elfExtractor struct {
 	allowGenericRegs bool
 }
 
-func (ee *elfExtractor) extractDebugDeltas() error {
-	var err error
-
+func (ee *elfExtractor) extractDebugDeltas() (err error) {
 	// Attempt finding the associated debug information file with .debug_frame,
 	// but ignore errors if it's not available; many production systems
 	// do not intentionally have debug packages installed.
 	debugELF, _ := ee.file.OpenDebugLink(ee.ref.FileName(), ee.ref)
 	if debugELF != nil {
 		err = ee.parseDebugFrame(debugELF)
-		debugELF.Close()
+		_ = debugELF.Close()
 	}
 	return err
 }
 
-func isLibCrypto(elfFile *pfelf.File) bool {
+func isLibGenericRegsAllowed(elfFile *pfelf.File) bool {
 	if name, err := elfFile.DynString(elf.DT_SONAME); err == nil && len(name) == 1 {
-		// Allow generic register CFA for openssl libcrypto
-		return strings.HasPrefix(name[0], "libcrypto.so.")
+		// Allow generic register CFA for openssl libcrypto, glibc and musl
+		n := name[0]
+		return strings.HasPrefix(n, "libcrypto.so.") ||
+			strings.HasPrefix(n, "libc.so.") ||
+			strings.HasPrefix(n, "ld-linux-")
 	}
 	return false
 }
@@ -115,6 +146,32 @@ func Extract(filename string, interval *sdtypes.IntervalData) error {
 	return ExtractELF(elfRef, interval)
 }
 
+// detectEntryCode matches machine code for known entry stubs, and detects its length.
+func detectEntryCode(machine elf.Machine, code []byte) int {
+	switch machine {
+	case elf.EM_X86_64:
+		return detectEntryX86(code)
+	case elf.EM_AARCH64:
+		return detectEntryARM(code)
+	default:
+		return 0
+	}
+}
+
+// detectEntry loads the entry stub from the ELF DSO entry and matches it.
+func detectEntry(ef *pfelf.File) int {
+	if ef.Entry == 0 {
+		return 0
+	}
+
+	// Typically 52-80 bytes, allow for a bit of variance
+	code, err := ef.VirtualMemory(int64(ef.Entry), 128, 128)
+	if err != nil {
+		return 0
+	}
+	return detectEntryCode(ef.Machine, code)
+}
+
 // ExtractELF takes a pfelf.Reference and provides the stack delta
 // intervals for it in the interval parameter.
 func ExtractELF(elfRef *pfelf.Reference, interval *sdtypes.IntervalData) error {
@@ -122,7 +179,13 @@ func ExtractELF(elfRef *pfelf.Reference, interval *sdtypes.IntervalData) error {
 	if err != nil {
 		return err
 	}
+	return extractFile(elfFile, elfRef, interval)
+}
 
+// extractFile extracts the elfFile stack deltas and uses the optional elfRef to resolve
+// debug link references if needed.
+func extractFile(elfFile *pfelf.File, elfRef *pfelf.Reference,
+	interval *sdtypes.IntervalData) (err error) {
 	// Parse the stack deltas from the ELF
 	filter := extractionFilter{}
 	deltas := sdtypes.StackDeltaArray{}
@@ -131,7 +194,13 @@ func ExtractELF(elfRef *pfelf.Reference, interval *sdtypes.IntervalData) error {
 		file:             elfFile,
 		deltas:           &deltas,
 		hooks:            &filter,
-		allowGenericRegs: isLibCrypto(elfFile),
+		allowGenericRegs: isLibGenericRegsAllowed(elfFile),
+	}
+
+	if entryLength := detectEntry(elfFile); entryLength != 0 {
+		filter.entryStart = uintptr(elfFile.Entry)
+		filter.entryEnd = filter.entryStart + uintptr(entryLength)
+		filter.entryPending = true
 	}
 
 	if err = ee.parseGoPclntab(); err != nil {
@@ -143,58 +212,26 @@ func ExtractELF(elfRef *pfelf.Reference, interval *sdtypes.IntervalData) error {
 	if err = ee.parseDebugFrame(elfFile); err != nil {
 		return fmt.Errorf("failure to parse debug_frame stack deltas: %v", err)
 	}
-	if len(deltas) < numIntervalsToOmitDebugLink {
+	if ee.ref != nil && len(deltas) < numIntervalsToOmitDebugLink {
 		// There is only few stack deltas. See if we find the .gnu_debuglink
 		// debug information for additional .debug_frame stack deltas.
 		if err = ee.extractDebugDeltas(); err != nil {
 			return fmt.Errorf("failure to parse debug stack deltas: %v", err)
 		}
 	}
+	if filter.entryPending {
+		filter.addEntryDeltas(ee.deltas)
+	}
 
 	// If multiple sources were merged, sort them.
 	if filter.unsortedFrames || (filter.ehFrames && filter.golangFrames) {
-		sort.Slice(deltas, func(i, j int) bool {
-			if deltas[i].Address != deltas[j].Address {
-				return deltas[i].Address < deltas[j].Address
-			}
-			// Make sure that the potential duplicate stop delta is sorted
-			// after the real delta.
-			return deltas[i].Info.Opcode < deltas[j].Info.Opcode
-		})
+		deltas.Sort()
 
-		maxDelta := 0
+		dedup := deltas[0:0]
 		for i := 0; i < len(deltas); i++ {
-			delta := &deltas[i]
-			if maxDelta > 0 {
-				// This duplicates the logic from StackDeltaArray.Add()
-				// to remove duplicate and redundant stack deltas.
-				prev := &deltas[maxDelta-1]
-				if prev.Hints&sdtypes.UnwindHintGap != 0 &&
-					prev.Address+sdtypes.MinimumGap >= delta.Address {
-					// The previous opcode is end-of-function marker, and
-					// the gap is not large. Reduce deltas by overwriting it.
-					if maxDelta <= 1 || deltas[maxDelta-2].Info != delta.Info {
-						*prev = *delta
-						continue
-					}
-					// The delta before end-of-function marker is same as
-					// what is being inserted now. Overwrite that.
-					prev = &deltas[maxDelta-2]
-					maxDelta--
-				}
-				if prev.Info == delta.Info {
-					prev.Hints |= delta.Hints & sdtypes.UnwindHintKeep
-					continue
-				}
-				if prev.Address == delta.Address {
-					*prev = *delta
-					continue
-				}
-			}
-			deltas[maxDelta] = *delta
-			maxDelta++
+			dedup.Add(deltas[i])
 		}
-		deltas = deltas[:maxDelta]
+		deltas = dedup
 	}
 
 	*interval = sdtypes.IntervalData{
