@@ -24,11 +24,8 @@ TARGET_ARCH ?= $(NATIVE_ARCH)
 TRACER_NAME ?= tracer.ebpf.$(TARGET_ARCH)
 
 CFLAGS = $(CGO_CFLAGS)
-ifeq ($(BUILD_TYPE),debug)
-	CFLAGS+=$(DEBUG_FLAGS)
-endif
 
-FLAGS=$(CFLAGS) \
+FLAGS=$(CFLAGS) -g \
 	-fno-jump-tables \
 	-nostdlib \
 	-nostdinc \
