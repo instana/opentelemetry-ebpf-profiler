@@ -7,6 +7,7 @@ WORKDIR /agent-go
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends --no-install-suggests \
         ca-certificates \
+        curl \
         gnupg2 \
         software-properties-common \
         wget \
@@ -52,6 +53,17 @@ RUN                                                                             
     && find "$INSTALL_DIR/include" -type d -exec chmod +x {} \;                    \
     && find "$INSTALL_DIR/include" -type f -exec chmod +r {} \;                    \
     && rm "$PB_FILE"
+
+# Set environment variables before rustup installation
+ENV CARGO_HOME=/usr/local/cargo
+ENV RUSTUP_HOME=/usr/local/rustup
+
+# Install rustup and cargo
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.84.1
+
+# Set mode bits
+RUN chmod -R a+w /usr/local/rustup \
+    && chmod -R a+w /usr/local/cargo
 
 # Append to /etc/profile for login shells
 RUN echo 'export PATH="$PATH"' >> /etc/profile
